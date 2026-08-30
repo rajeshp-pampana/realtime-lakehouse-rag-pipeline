@@ -1,0 +1,3 @@
+# Kubernetes Deployments for the API, UI, and streaming consumer.
+# Authored and validated (kind + kubeconform in CI) in Milestone 5.
+# Placeholder until then.

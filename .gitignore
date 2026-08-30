@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Environment
+.env
+
+# Data / Lakehouse artifacts (kept out of git; structure preserved via .gitkeep)
+data/raw/*
+!data/raw/.gitkeep
+data/delta/
+data/vectorstore/
+data/checkpoints/
+
+# Spark
+spark-warehouse/
+metastore_db/
+derby.log
+
+# Airflow (when run outside Docker)
+airflow.db
+airflow.cfg
+airflow-webserver.pid
+logs/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,11 @@
+# Prometheus scrape config. Populated in Milestone 6.
+# Targets will include: the FastAPI service (/metrics), the streaming consumer
+# (Kafka consumer lag, events/sec), and batch job push-gateway metrics.
+
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: placeholder
+    static_configs:
+      - targets: []

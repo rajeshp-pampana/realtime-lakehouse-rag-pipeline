@@ -1,0 +1,14 @@
+{
+  "__comment": "Grafana dashboard for pipeline health. Built in Milestone 6.",
+  "__panels_planned": [
+    "batch job duration",
+    "rows ingested per run",
+    "retrieval latency",
+    "failure counts",
+    "Kafka consumer lag",
+    "streaming throughput (events/sec)"
+  ],
+  "title": "Pipeline Health",
+  "schemaVersion": 39,
+  "panels": []
+}
