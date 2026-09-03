@@ -1,26 +1,67 @@
 # Local development stack.
 #
-# Milestone 1 (this):  airflow  -- single-process `airflow standalone`
-#                                  (SQLite + SequentialExecutor). Deliberately
-#                                  not the full multi-container official
-#                                  reference compose (webserver/scheduler/
-#                                  triggerer/worker/Postgres/Redis) — this
-#                                  machine has 8 GB RAM and one linear DAG
-#                                  doesn't need that topology. Swapped for a
-#                                  heavier setup later only if a milestone
-#                                  actually needs it (e.g. real parallelism).
-# Milestone 2 adds:  kafka (KRaft mode, single broker), tick-producer, stream-consumer
+# Milestone 1:       airflow  -- single-process `airflow standalone`
+#                                (SQLite + SequentialExecutor). Deliberately
+#                                not the full multi-container official
+#                                reference compose (webserver/scheduler/
+#                                triggerer/worker/Postgres/Redis) — this
+#                                machine has 8 GB RAM and one linear DAG
+#                                doesn't need that topology. Swapped for a
+#                                heavier setup later only if a milestone
+#                                actually needs it (e.g. real parallelism).
+#                                Verified via WSL2 + `airflow dags test`
+#                                instead of this compose file for M1 itself
+#                                (faster to a verified run on this machine);
+#                                this service is kept for Milestone 5.
+# Milestone 2 (this): kafka    -- single-broker KRaft mode (no ZooKeeper).
+#                                tick_producer.py / stream_consumer.py run as
+#                                plain WSL2 processes against this broker for
+#                                now (containerized in Milestone 5).
 # Milestone 4 adds:  api (FastAPI)
-# Milestone 5 adds:  ui (Streamlit), full Dockerfile wiring
+# Milestone 5 adds:  ui (Streamlit), tick-producer/stream-consumer containers,
+#                     full Dockerfile wiring
 # Milestone 6 adds:  prometheus, grafana
 #
 # On an 8 GB machine these are brought up in subsets (see README "Running
-# locally"). CI (.github/workflows/ci.yml) brings the full stack up as the
-# end-to-end proof.
+# locally") - e.g. `docker compose up kafka` alone, without also running
+# Airflow/Spark at the same time. CI brings up what each milestone needs as
+# its own end-to-end proof.
 
 name: realtime-lakehouse-rag-pipeline
 
 services:
+  kafka:
+    image: apache/kafka:4.1.0
+    container_name: rlrp-kafka
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      # PLAINTEXT (19092) is for other containers on this compose network
+      # (e.g. Milestone 5's containerized stream-consumer); PLAINTEXT_HOST
+      # (9092) is for host-side processes - what tick_producer.py /
+      # stream_consumer.py use today, running as plain WSL2 processes.
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:19092,CONTROLLER://0.0.0.0:9093,PLAINTEXT_HOST://0.0.0.0:9092"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:19092,PLAINTEXT_HOST://localhost:9092"
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@localhost:9093"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      CLUSTER_ID: "ciWo7IWazngRchmPES6q5A=="
+    healthcheck:
+      # kafka-broker-api-versions.sh spins up a small JVM client - on this
+      # machine that alone can take >10s, which was flipping this healthy
+      # broker to "unhealthy" on timeout alone (confirmed via `docker inspect
+      # --format '{{json .State.Health}}'`: "Health check exceeded timeout
+      # (10s)" while the broker itself was fine and serving real traffic).
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"]
+      interval: 15s
+      timeout: 20s
+      retries: 5
+      start_period: 30s
+
   airflow:
     build:
       context: ..

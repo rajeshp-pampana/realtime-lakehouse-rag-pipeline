@@ -62,7 +62,7 @@ realtime-lakehouse-rag-pipeline/
 │   ├── ingestion/fetch_market_data.py   # EOD OHLCV pull; ingest_to_delta() writes the raw Delta table
 │   ├── streaming/
 │   │   ├── tick_producer.py             # simulated intraday tick producer -> Kafka
-│   │   └── stream_consumer.py           # Spark Structured Streaming: Kafka -> Delta
+│   │   └── stream_consumer.py           # Spark Structured Streaming: Kafka -> ticks_raw Delta table
 │   ├── processing/transform_spark.py    # PySpark batch transforms -> curated Delta table
 │   ├── rag/
 │   │   ├── index_builder.py             # embeds + indexes historical context docs
@@ -75,7 +75,7 @@ realtime-lakehouse-rag-pipeline/
 ├── infra/                           # docker-compose, Dockerfiles, k8s manifests/Helm
 ├── .github/workflows/ci.yml         # lint + test (+ image build, e2e in M6)
 ├── data/raw/                        # baseline CSVs (ported Streamlit console still reads these until M4)
-├── data/delta/                      # Delta Lake tables (bronze `ohlcv_raw`, silver `ohlcv_curated`) — gitignored
+├── data/delta/                      # Delta Lake tables: ohlcv_raw/ticks_raw (bronze), ohlcv_curated (silver) — gitignored
 ├── docs/METRICS.md                  # measured metrics log (no estimates)
 └── requirements.txt
 ```
@@ -83,7 +83,7 @@ realtime-lakehouse-rag-pipeline/
 ## Build milestones
 
 - [x] **M1 — Orchestration + Lakehouse foundation.** Airflow DAG; Delta Lake tables; pandas transform ported to PySpark local mode.
-- [ ] **M2 — Streaming ingestion.** Kafka (KRaft); simulated tick producer; Spark Structured Streaming consumer writing the same Delta tables.
+- [x] **M2 — Streaming ingestion.** Kafka (KRaft); simulated tick producer; Spark Structured Streaming consumer writing the same Delta tables.
 - [ ] **M3 — RAG layer.** Local vector store; index past briefings/context; retrieval step before every LLM call.
 - [ ] **M4 — Service split.** FastAPI service with OpenAPI docs; Streamlit becomes a thin client.
 - [ ] **M5 — Containerization + deployment.** Dockerize API/UI/streaming; Kafka in docker-compose; k8s manifests / Helm on a local `kind` cluster.
@@ -157,6 +157,53 @@ installed on this machine, and WSL2 (needed either way — Docker Desktop's own
 backend on Windows *is* WSL2) got us to a real, verified Airflow run faster and
 lighter than also installing and configuring Docker Desktop on top. They fold
 into **Milestone 5**'s containerization work instead.
+
+### Milestone 2 — streaming ingestion
+
+The intraday tick stream is entirely **simulated**: `tick_producer.py` generates
+a synthetic random walk per ticker (seeded from that ticker's latest known
+Close in the batch raw Delta table), not a paid real-time market data feed.
+
+**Design note** on "writes micro-batches into the same Delta tables the batch
+job uses": ticks (event-level) and the batch DAG's daily bars (one row per
+ticker per day) are different natural grains, so the streaming consumer writes
+its own bronze table, `data/delta/ticks_raw`, rather than unioning mismatched
+schemas into `ohlcv_raw` — real trading/risk platforms keep tick and bar tables
+separate for the same reason, sometimes compacting ticks into bars downstream.
+Both tables live in the same Lakehouse root (`data/delta/`), which is what
+"alongside the batch history" refers to.
+
+```bash
+# Kafka (KRaft mode, single broker) via Docker Engine in WSL2 - no Docker Desktop:
+docker compose -f infra/docker-compose.yml up -d kafka
+
+# Pre-create the topic before starting either process. Spark's Kafka source
+# fails hard (UnknownTopicOrPartitionException, no retry) if the consumer
+# subscribes before the topic exists - found this the hard way.
+docker exec rlrp-kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 \
+    --create --topic market.ticks --partitions 1 --replication-factor 1 --if-not-exists
+
+# Two plain WSL2 processes, no Docker for these yet (containerized in M5):
+python -m src.streaming.stream_consumer --timeout 110 &   # start first - see note below
+sleep 20                                                  # let the query warm up
+python -m src.streaming.tick_producer --duration 45 --interval 1
+```
+
+Start the consumer well before the producer: Spark Structured Streaming's query
+startup (Kafka source init, checkpoint bootstrap) is inconsistent on this
+machine - anywhere from ~1s to ~30-70s to commit its first micro-batch, not
+correlated with backlog size or a cold JAR cache. Once running, watch
+`data/delta/ticks_raw` grow while the producer is still active:
+
+```bash
+python -c "from deltalake import DeltaTable; print(len(DeltaTable('data/delta/ticks_raw').to_pandas()))"
+```
+
+**Verified**, 2026-09-04: 765 events published (17 tickers, 1/sec, 45s) → 765
+landed in `ticks_raw`, 0 lost, across 17 incremental Delta commits, while the
+producer was still running. Real throughput, consumer lag (max 136, final 0),
+and streaming-to-Delta write latency (p50 2.82s, close to the 2s trigger
+interval) in [docs/METRICS.md](docs/METRICS.md).
 
 ## Measured metrics
 
