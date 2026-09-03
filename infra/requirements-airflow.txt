@@ -1,0 +1,12 @@
+# Runtime dependencies for tasks executed *inside* the Airflow container.
+# Deliberately separate from the top-level requirements.txt: Airflow ships its
+# own pinned dependency set, and this file only needs to cover what the DAG's
+# tasks import, not the API/UI/dev tooling.
+
+pandas>=2.2,<2.3
+pyarrow>=17,<19
+yfinance>=0.2.50,<0.3
+deltalake>=0.21,<0.25
+pyspark==3.5.3
+setuptools>=70
+python-dotenv>=1.0,<2.0

@@ -3,18 +3,23 @@
 Baseline behaviour (ported from the original AI Market Terminal repo): pull ~1 month
 of daily OHLCV bars per ticker from Yahoo Finance and land them locally.
 
-Milestone 1 adapts this module to write into a versioned Delta Lake table
-(``data/delta/ohlcv_raw``) instead of per-ticker CSV files, and exposes a callable
-entry point that the Airflow DAG can invoke as a task.
+Milestone 1 adds ``ingest_to_delta``: it fetches the same data and appends it into
+a versioned Delta Lake table (``data/delta/ohlcv_raw`` by default) instead of
+per-ticker CSV files, and is the callable the Airflow DAG invokes as its ingest
+task. ``fetch_and_save_data`` (CSV) is kept as-is for the ported baseline Streamlit
+console, which still reads local CSVs until Milestone 4 moves it onto the API.
 """
 
 from __future__ import annotations
 
 import os
-from datetime import datetime
+import time
+from datetime import UTC, datetime
 
 import pandas as pd
 import yfinance as yf
+
+from src import config
 
 # Master portfolio list (unchanged from baseline).
 TICKERS = [
@@ -23,6 +28,20 @@ TICKERS = [
 ]
 
 RAW_DIR = os.path.join("data", "raw")
+
+# Schema written to the raw Delta table. Enforced explicitly on every ingest so a
+# type drift in a Yahoo Finance response (e.g. Volume coming back as float once)
+# fails loudly instead of silently corrupting the table.
+_DELTA_DTYPES = {
+    "Date": "string",
+    "Ticker": "string",
+    "Open": "float64",
+    "High": "float64",
+    "Low": "float64",
+    "Close": "float64",
+    "Volume": "int64",
+    "ingested_at_utc": "string",
+}
 
 
 def fetch_ticker_history(ticker: str, period: str = "1mo") -> pd.DataFrame:
@@ -65,5 +84,57 @@ def fetch_and_save_data(tickers: list[str] | None = None) -> str:
     return RAW_DIR
 
 
+def ingest_to_delta(
+    tickers: list[str] | None = None, table_path: str | None = None
+) -> dict:
+    """Fetch OHLCV for each ticker and append the batch into the raw Delta table.
+
+    This is the Airflow ``ingest`` task's entry point. Returns a metrics dict
+    (rows ingested, tickers ok/failed, duration, resulting table version) — the
+    numbers docs/METRICS.md and the README's metrics table are filled in from.
+    """
+    from deltalake import DeltaTable, write_deltalake
+
+    tickers = tickers or TICKERS
+    table_path = table_path or config.DELTA_OHLCV_RAW
+    started = time.perf_counter()
+    now_iso = datetime.now(UTC).isoformat()
+
+    frames: list[pd.DataFrame] = []
+    failed: list[str] = []
+    for ticker in tickers:
+        print(f"Fetching data for {ticker}...")
+        df = fetch_ticker_history(ticker, period=config.INGEST_PERIOD)
+        if df.empty:
+            print(f"Warning: no data returned for {ticker}")
+            failed.append(ticker)
+            continue
+        frames.append(df)
+
+    if not frames:
+        raise RuntimeError("Ingestion produced no rows for any ticker; aborting Delta write")
+
+    batch = pd.concat(frames, ignore_index=True)
+    batch["ingested_at_utc"] = now_iso
+    for col, dtype in _DELTA_DTYPES.items():
+        batch[col] = batch[col].astype(dtype)
+    batch = batch[list(_DELTA_DTYPES)]
+
+    os.makedirs(os.path.dirname(table_path) or ".", exist_ok=True)
+    write_deltalake(table_path, batch, mode="append")
+    table_version = DeltaTable(table_path).version()
+
+    metrics = {
+        "rows_ingested": int(len(batch)),
+        "tickers_ok": len(frames),
+        "tickers_failed": failed,
+        "duration_seconds": round(time.perf_counter() - started, 2),
+        "table_path": table_path,
+        "table_version": table_version,
+    }
+    print(f"[ingest] {metrics}")
+    return metrics
+
+
 if __name__ == "__main__":
-    fetch_and_save_data()
+    ingest_to_delta()

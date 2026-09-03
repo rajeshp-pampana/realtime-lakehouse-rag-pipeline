@@ -9,6 +9,16 @@ yfinance>=0.2.50,<0.3
 pandas>=2.2,<2.3
 pyarrow>=17,<19
 
+# --- Lakehouse (Milestone 1) ---
+deltalake>=0.21,<0.25
+pyspark==3.5.3
+# PySpark 3.5.x's pandas<->Spark conversion path still does
+# `from distutils.version import LooseVersion`, and distutils was removed from
+# the stdlib in Python 3.12. setuptools ships a compatibility shim that makes
+# `import distutils` work again - without it, spark.createDataFrame(pandas_df)
+# fails immediately with ModuleNotFoundError.
+setuptools>=70
+
 # --- API (built out in Milestone 4; kept here so src/api/main.py imports in CI) ---
 fastapi>=0.115,<0.130
 uvicorn[standard]>=0.30,<0.40
@@ -29,7 +39,6 @@ pytest>=8.2,<9.0
 pytest-cov>=5.0,<7.0
 
 # --- Added in later milestones ---
-# Milestone 1: pyspark, deltalake
 # Milestone 2: kafka-python
 # Milestone 3: chromadb
 # Milestone 6: prometheus-client, structlog

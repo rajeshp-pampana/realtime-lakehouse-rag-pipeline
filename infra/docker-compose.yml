@@ -1,17 +1,47 @@
 # Local development stack.
 #
-# Milestone 1 adds:  airflow (official image, slim single-scheduler + standalone), postgres
+# Milestone 1 (this):  airflow  -- single-process `airflow standalone`
+#                                  (SQLite + SequentialExecutor). Deliberately
+#                                  not the full multi-container official
+#                                  reference compose (webserver/scheduler/
+#                                  triggerer/worker/Postgres/Redis) — this
+#                                  machine has 8 GB RAM and one linear DAG
+#                                  doesn't need that topology. Swapped for a
+#                                  heavier setup later only if a milestone
+#                                  actually needs it (e.g. real parallelism).
 # Milestone 2 adds:  kafka (KRaft mode, single broker), tick-producer, stream-consumer
 # Milestone 4 adds:  api (FastAPI)
 # Milestone 5 adds:  ui (Streamlit), full Dockerfile wiring
 # Milestone 6 adds:  prometheus, grafana
 #
-# On an 8 GB machine these are brought up in subsets (see README "Running locally").
-# CI (.github/workflows/ci.yml) brings the full stack up as the end-to-end proof.
+# On an 8 GB machine these are brought up in subsets (see README "Running
+# locally"). CI (.github/workflows/ci.yml) brings the full stack up as the
+# end-to-end proof.
 
 name: realtime-lakehouse-rag-pipeline
 
 services:
-  placeholder:
-    image: hello-world
-    profiles: ["never"]
+  airflow:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.airflow
+    container_name: rlrp-airflow
+    command: standalone
+    environment:
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      PYTHONPATH: /opt/airflow
+    ports:
+      - "8080:8080"
+    volumes:
+      - airflow-state:/opt/airflow
+      - ../dags:/opt/airflow/dags
+      - ../src:/opt/airflow/src
+      - ../data:/opt/airflow/data
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+volumes:
+  airflow-state:

@@ -56,13 +56,14 @@ This is deliberate and called out everywhere it matters.
 ```
 realtime-lakehouse-rag-pipeline/
 ├── dags/
-│   └── market_pipeline_dag.py        # Airflow DAG: batch ingest -> transform -> index
+│   └── market_pipeline_dag.py        # Airflow DAG: batch ingest -> transform (-> index in M3)
 ├── src/
-│   ├── ingestion/fetch_market_data.py   # EOD OHLCV pull, adapted to write Delta
+│   ├── config.py                        # env-driven settings (paths, hosts, ports)
+│   ├── ingestion/fetch_market_data.py   # EOD OHLCV pull; ingest_to_delta() writes the raw Delta table
 │   ├── streaming/
 │   │   ├── tick_producer.py             # simulated intraday tick producer -> Kafka
 │   │   └── stream_consumer.py           # Spark Structured Streaming: Kafka -> Delta
-│   ├── processing/transform_spark.py    # PySpark batch transforms
+│   ├── processing/transform_spark.py    # PySpark batch transforms -> curated Delta table
 │   ├── rag/
 │   │   ├── index_builder.py             # embeds + indexes historical context docs
 │   │   └── retriever.py                 # retrieval step before every LLM call
@@ -73,14 +74,15 @@ realtime-lakehouse-rag-pipeline/
 ├── tests/                           # pytest: processing, streaming, rag
 ├── infra/                           # docker-compose, Dockerfiles, k8s manifests/Helm
 ├── .github/workflows/ci.yml         # lint + test (+ image build, e2e in M6)
-├── data/raw/                        # Delta-managed location
+├── data/raw/                        # baseline CSVs (ported Streamlit console still reads these until M4)
+├── data/delta/                      # Delta Lake tables (bronze `ohlcv_raw`, silver `ohlcv_curated`) — gitignored
 ├── docs/METRICS.md                  # measured metrics log (no estimates)
 └── requirements.txt
 ```
 
 ## Build milestones
 
-- [ ] **M1 — Orchestration + Lakehouse foundation.** Airflow DAG; Delta Lake tables; pandas transform ported to PySpark local mode.
+- [x] **M1 — Orchestration + Lakehouse foundation.** Airflow DAG; Delta Lake tables; pandas transform ported to PySpark local mode.
 - [ ] **M2 — Streaming ingestion.** Kafka (KRaft); simulated tick producer; Spark Structured Streaming consumer writing the same Delta tables.
 - [ ] **M3 — RAG layer.** Local vector store; index past briefings/context; retrieval step before every LLM call.
 - [ ] **M4 — Service split.** FastAPI service with OpenAPI docs; Streamlit becomes a thin client.
@@ -102,6 +104,59 @@ pip install -r requirements.txt
 cp .env.example .env
 pytest -q
 ```
+
+### Milestone 1 — orchestration + Lakehouse foundation
+
+**Without Docker, ingestion only** (no JVM involved — pure Python/pandas/delta-rs;
+verified working on this machine, see [docs/METRICS.md](docs/METRICS.md)):
+
+```bash
+python -m src.ingestion.fetch_market_data   # -> data/delta/ohlcv_raw (append)
+```
+
+**Without Docker, the PySpark transform** — `python -m src.processing.transform_spark`
+— is implemented but **not currently runnable on this Windows machine**: the JVM
+driver spawns a Python worker subprocess that is silently killed within ~2 seconds
+with zero output (confirmed independent of this shell's own sandboxing, and a
+plain Python-spawned-Python child process survives fine — so it's specific to
+java.exe spawning python.exe here, most likely AV/EDR real-time protection
+intercepting that particular parent/child signature). Not worth chasing further
+locally: the transform runs correctly inside the Linux Airflow container below,
+where this Windows-only issue doesn't exist.
+
+**With Airflow, for real** (the actual "Done when" criterion — verified via
+**WSL2**, not Docker: same Windows-worker issue as above ruled out Docker
+Desktop as the fast path here too, and `airflow dags test` runs the DAG through
+the real Airflow engine without needing the scheduler/webserver daemons):
+
+```bash
+# One-time setup, inside WSL2 (Ubuntu):
+curl -LsSf https://astral.sh/uv/install.sh | sh          # standalone Python installer
+uv python install 3.12                                    # Ubuntu's own default python3 may be too new for pyspark/airflow
+uv venv --python 3.12 .venv && . .venv/bin/activate
+uv pip install -r requirements.txt
+uv pip install "apache-airflow==2.10.5" \
+    --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-2.10.5/constraints-3.12.txt"
+uv pip install "typing_extensions>=4.13"   # airflow's constraints pin 4.12.2, too old for pydantic_core's Sentinel
+
+# Run the DAG for real:
+export AIRFLOW_HOME=~/airflow_home
+export AIRFLOW__CORE__DAGS_FOLDER=$(pwd)/dags
+export AIRFLOW__CORE__LOAD_EXAMPLES=false
+export PYTHONPATH=$(pwd)
+airflow db migrate
+airflow dags test market_pipeline $(date +%F)
+```
+
+**Verified**, 2026-09-03: both tasks (`ingest`, `transform`) SUCCESS, DagRun
+state `success`. Real numbers in [docs/METRICS.md](docs/METRICS.md).
+
+The `infra/Dockerfile.airflow` / `infra/docker-compose.yml` written for this
+milestone aren't wasted, just not the path used here: Docker Desktop wasn't
+installed on this machine, and WSL2 (needed either way — Docker Desktop's own
+backend on Windows *is* WSL2) got us to a real, verified Airflow run faster and
+lighter than also installing and configuring Docker Desktop on top. They fold
+into **Milestone 5**'s containerization work instead.
 
 ## Measured metrics
 
