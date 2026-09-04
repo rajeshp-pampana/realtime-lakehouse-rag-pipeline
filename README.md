@@ -65,9 +65,10 @@ realtime-lakehouse-rag-pipeline/
 │   │   └── stream_consumer.py           # Spark Structured Streaming: Kafka -> ticks_raw Delta table
 │   ├── processing/transform_spark.py    # PySpark batch transforms -> curated Delta table
 │   ├── rag/
-│   │   ├── index_builder.py             # embeds + indexes historical context docs
-│   │   └── retriever.py                 # retrieval step before every LLM call
-│   ├── llm/briefing_generator.py        # Llama 3 via Ollama, retrieval-grounded
+│   │   ├── index_builder.py             # embeds + indexes docs/context + data/briefings into Chroma
+│   │   ├── retriever.py                 # retrieval step before every LLM call
+│   │   └── _chromadb_compat.py          # Windows onnxruntime/chromadb import-time fix
+│   ├── llm/briefing_generator.py        # Llama 3 via Ollama, retrieval-grounded, saves each briefing
 │   └── api/main.py                      # FastAPI service, OpenAPI docs enabled
 ├── ui/streamlit_app.py              # internal analyst console, calls the API
 ├── monitoring/                      # prometheus.yml + grafana dashboard
@@ -76,6 +77,9 @@ realtime-lakehouse-rag-pipeline/
 ├── .github/workflows/ci.yml         # lint + test (+ image build, e2e in M6)
 ├── data/raw/                        # baseline CSVs (ported Streamlit console still reads these until M4)
 ├── data/delta/                      # Delta Lake tables: ohlcv_raw/ticks_raw (bronze), ohlcv_curated (silver) — gitignored
+├── data/briefings/                  # every briefing ever generated (frontmatter + text) — gitignored, grows locally
+├── data/vectorstore/                # Chroma persistent index — gitignored
+├── docs/context/                    # schema/ticker/methodology notes — real, committed, seeds the RAG index
 ├── docs/METRICS.md                  # measured metrics log (no estimates)
 └── requirements.txt
 ```
@@ -84,7 +88,7 @@ realtime-lakehouse-rag-pipeline/
 
 - [x] **M1 — Orchestration + Lakehouse foundation.** Airflow DAG; Delta Lake tables; pandas transform ported to PySpark local mode.
 - [x] **M2 — Streaming ingestion.** Kafka (KRaft); simulated tick producer; Spark Structured Streaming consumer writing the same Delta tables.
-- [ ] **M3 — RAG layer.** Local vector store; index past briefings/context; retrieval step before every LLM call.
+- [x] **M3 — RAG layer.** Local vector store; index past briefings/context; retrieval step before every LLM call.
 - [ ] **M4 — Service split.** FastAPI service with OpenAPI docs; Streamlit becomes a thin client.
 - [ ] **M5 — Containerization + deployment.** Dockerize API/UI/streaming; Kafka in docker-compose; k8s manifests / Helm on a local `kind` cluster.
 - [ ] **M6 — CI/CD + tests + observability.** pytest for batch/stream/retrieval; GitHub Actions lint/test/build; Prometheus + Grafana pipeline-health dashboard.
@@ -204,6 +208,41 @@ landed in `ticks_raw`, 0 lost, across 17 incremental Delta commits, while the
 producer was still running. Real throughput, consumer lag (max 136, final 0),
 and streaming-to-Delta write latency (p50 2.82s, close to the 2s trigger
 interval) in [docs/METRICS.md](docs/METRICS.md).
+
+### Milestone 3 — RAG layer
+
+Local vector store: **Chroma** (persistent, `data/vectorstore/`). Embeddings:
+**Ollama's `nomic-embed-text`** (768-dim, ~274MB), not `sentence-transformers`
+— keeps the whole stack local/no-new-runtime and avoids pulling in torch
+(2GB+) on an 8 GB machine, consistent with the project's privacy-first story.
+
+The index covers two sources: `docs/context/` (schema notes, ticker
+reference, methodology/governance notes — real project documentation,
+committed to the repo) and `data/briefings/` (every briefing the pipeline has
+ever generated, saved automatically — gitignored, grows locally as you use
+it). `src/llm/briefing_generator.py` now always retrieves before generating:
+the retrieved passages are injected into the prompt, labeled by source, with
+an explicit instruction to cite what it actually draws on.
+
+```bash
+python -m src.rag.index_builder                    # build/refresh the index
+python -m src.rag.retriever "MSFT technical momentum"   # query it directly
+python -m src.llm.briefing_generator MSFT           # generate a grounded briefing
+```
+
+A Windows-specific wart, fixed: chromadb's `Collection` class evaluates its
+default (ONNX-based) embedding function as a class-level default argument at
+`import chromadb` time, which needs `onnxruntime` importable — but
+`onnxruntime`'s native extension reliably fails to load in the same process
+as `pandas`/`pyarrow` (a real DLL conflict, reproduced in isolation: either
+import alone works, the combination doesn't). Since this project always
+supplies its own embeddings explicitly and never touches chromadb's default,
+`src/rag/_chromadb_compat.py` pre-registers a dummy `onnxruntime` module
+before `chromadb` is ever imported, sidestepping the conflict entirely
+without needing the real package to actually work.
+
+**Verified**: see [docs/METRICS.md](docs/METRICS.md) for the real generated
+briefing, its cited sources, and measured retrieval/generation latency.
 
 ## Measured metrics
 

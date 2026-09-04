@@ -32,7 +32,11 @@ TICK_INTERVAL_SECONDS = float(os.environ.get("TICK_INTERVAL_SECONDS", "1"))
 # --- LLM / RAG (Milestone 3) ---
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3")
+OLLAMA_EMBED_MODEL = os.environ.get("OLLAMA_EMBED_MODEL", "nomic-embed-text")
 RAG_TOP_K = int(os.environ.get("RAG_TOP_K", "4"))
+RAG_COLLECTION = os.environ.get("RAG_COLLECTION", "market_context")
+CONTEXT_DOCS_DIR = os.environ.get("CONTEXT_DOCS_DIR", "docs/context")
+BRIEFINGS_DIR = os.environ.get("BRIEFINGS_DIR", "data/briefings")
 
 # --- API (Milestone 4) ---
 API_HOST = os.environ.get("API_HOST", "0.0.0.0")

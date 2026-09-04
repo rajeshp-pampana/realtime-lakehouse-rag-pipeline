@@ -41,6 +41,22 @@ pytest-cov>=5.0,<7.0
 # --- Streaming (Milestone 2) ---
 kafka-python-ng>=2.2,<3.0
 
+# --- RAG (Milestone 3) ---
+chromadb>=0.5,<0.6
+# chromadb depends on chroma-hnswlib, a C extension with no prebuilt wheel for
+# every recent version on Windows + Python 3.12 - pip falls back to a source
+# build, which fails without MSVC Build Tools. Pinned to a version that does
+# ship a cp312-win_amd64 wheel; still installs fine on Linux/CI either way.
+chroma-hnswlib==0.7.5
+# chromadb's Collection class evaluates its default (ONNX-based) embedding
+# function as a class-level default argument at import time, needing
+# onnxruntime importable - but its native extension is unreliable on Windows
+# once pandas/pyspark are also loaded (a real DLL conflict, worse than a
+# clean ImportError - a full access violation in some import orders). Since
+# this project always passes its own (Ollama) embeddings explicitly and
+# never calls chromadb's default, src/rag/_chromadb_compat.py stubs
+# `sys.modules["onnxruntime"]` before chromadb is ever imported - so the
+# real onnxruntime package isn't needed here at all, on any platform.
+
 # --- Added in later milestones ---
-# Milestone 3: chromadb
 # Milestone 6: prometheus-client, structlog

@@ -18,6 +18,8 @@ data/raw/*
 data/delta/
 data/vectorstore/
 data/checkpoints/
+data/briefings/*
+!data/briefings/.gitkeep
 
 # Spark
 spark-warehouse/

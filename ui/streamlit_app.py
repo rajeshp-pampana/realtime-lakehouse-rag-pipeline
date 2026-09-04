@@ -11,14 +11,22 @@ the UI and API start/stop independently.
 
 from __future__ import annotations
 
+import sys
 from datetime import datetime
+from pathlib import Path
 
-import ollama
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 from plotly.subplots import make_subplots
+
+# `streamlit run` puts this file's own directory on sys.path, not the repo
+# root - add it explicitly so `from src...` resolves regardless of how/where
+# streamlit is invoked from.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from src.llm.briefing_generator import generate_briefing  # noqa: E402
 
 st.set_page_config(page_title="Institutional Portfolio Dashboard", layout="wide")
 st.title("INSTITUTIONAL PORTFOLIO DASHBOARD")
@@ -179,28 +187,17 @@ try:
 
     st.subheader("AI QUANTITATIVE BRIEFING")
     if st.button(f"Generate Briefing for {selected_ticker}"):
-        with st.spinner("Running local quantitative inference..."):
-            recent_data = df.tail(5)
-            prompt = f"""
-            You are a Senior Equity Research Analyst at a top-tier Wall Street investment bank.
-            Review the following 5-day trailing market data for {selected_ticker}:
-            {recent_data.to_string(index=False)}
-
-            Provide a concise, 2-sentence market update suitable for an institutional
-            morning briefing. Focus on price action, momentum, and technical sentiment.
-            """
+        with st.spinner("Retrieving context and running local inference..."):
             try:
-                response = ollama.chat(
-                    model="llama3",
-                    messages=[
-                        {"role": "system", "content": "You are a Wall Street Equity Research Analyst."},
-                        {"role": "user", "content": prompt},
-                    ],
-                )
-                st.write(
-                    response["message"]["content"]
-                    if isinstance(response, dict)
-                    else response.message.content
+                result = generate_briefing(selected_ticker, df.tail(5))
+                st.write(result["text"])
+                if result["retrieved_sources"]:
+                    st.caption(f"Grounded in: {', '.join(result['retrieved_sources'])}")
+                else:
+                    st.caption("No prior context retrieved (index empty or not yet built).")
+                st.caption(
+                    f"retrieval {result['retrieval_latency_seconds']}s · "
+                    f"generation {result['generation_latency_seconds']}s"
                 )
             except Exception as exc:  # noqa: BLE001
                 st.error(f"Inference failed. Error: {exc}")
