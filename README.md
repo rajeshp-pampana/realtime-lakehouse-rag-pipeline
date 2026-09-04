@@ -1,302 +1,227 @@
 # realtime-lakehouse-rag-pipeline
 
 A hybrid **batch + streaming Lakehouse** for multi-asset equity data, with a
-**retrieval-grounded LLM** briefing layer, served through a documented **FastAPI**
-service and an internal **Streamlit** analyst console.
+**retrieval-grounded LLM** briefing layer, served through a documented
+**FastAPI** service and an internal **Streamlit** analyst console.
 
-Migrated and upgraded from the original *AI Market Terminal* (a single-machine
-Yahoo Finance -> pandas -> Streamlit + local Llama 3 script) into a
-production-shaped pipeline using the same stack used day-to-day in banking data
+Migrated and upgraded from the original *AI Market Terminal* — a single-machine
+Yahoo Finance → pandas → Streamlit + local Llama 3 script — into a
+production-shaped pipeline using the stack used day-to-day in banking data
 engineering: Apache Airflow, PySpark, Apache Kafka, Delta Lake, Docker,
-Kubernetes, and GitHub Actions.
+Kubernetes, Prometheus/Grafana, and GitHub Actions.
 
-> **Status: in active build.** This repo is being built milestone by milestone;
-> each milestone lands in a working, committed, CI-passing state. See the
-> checklist below for what is live.
+> Every number in this README was measured on a real run and is traceable to a
+> row in [docs/METRICS.md](docs/METRICS.md). Nothing here is estimated.
 
 ---
 
-## Target architecture
+## What it does
+
+- **Batch**: an Airflow DAG pulls end-of-day OHLCV for 17 tickers into a
+  versioned Delta Lake table, then computes technical indicators in PySpark and
+  writes a curated table.
+- **Streaming**: a simulated intraday tick feed flows through Kafka into a Spark
+  Structured Streaming consumer that lands micro-batches in a separate Delta
+  bronze table.
+- **RAG**: every LLM briefing runs a retrieval step first, grounding the output
+  in indexed context documents *and* previously generated briefings — so the
+  corpus feeds back into itself.
+- **Serving**: a versioned FastAPI service with OpenAPI docs exposes the
+  lakehouse; the Streamlit console is a thin HTTP client of it.
+- **Operations**: everything is containerised, deploys to Kubernetes via a Helm
+  chart, and reports to Prometheus/Grafana.
+
+The intraday tick stream is a **simulated** synthetic feed (a random walk around
+each ticker's last close), not a paid market data subscription. That is called
+out everywhere it matters rather than left ambiguous.
+
+---
+
+## Architecture
 
 ```
-                       ┌─────────────────────────────┐
-   Yahoo Finance  ───▶  │  Airflow DAG (end-of-day)    │
-   (daily OHLCV)        │  ingest → transform → index │
-                       └──────────────┬──────────────┘
-                                      │  PySpark (local mode)
-                                      ▼
- Simulated intraday   ┌──────────┐   ┌──────────────────┐   ┌───────────────┐
- tick stream  ──────▶ │  Kafka   │──▶│ Spark Structured │──▶│  Delta Lake   │
- (synthetic events)   │ (KRaft)  │   │   Streaming      │   │  (batch +     │
-                       └──────────┘   └──────────────────┘   │   streaming)  │
-                                                             └───────┬───────┘
-                                                                     │
-                            ┌────────────────────────────────────────┤
-                            ▼                                        ▼
-                    ┌───────────────┐                        ┌───────────────┐
-                    │ RAG retriever │  (local vector store)  │  FastAPI      │
-                    │  + Llama 3    │ ◀───────────────────── │  (OpenAPI)    │
-                    │  (Ollama)     │                        └───────┬───────┘
-                    └───────────────┘                                │
-                                                              ┌──────▼──────┐
-                                                              │  Streamlit  │
-                                                              │  console    │
-                                                              └─────────────┘
+   Yahoo Finance            ┌──────────────────────────────┐
+   (daily OHLCV)  ────────▶ │  Airflow DAG (end-of-day)    │
+                            │  ingest ──▶ transform        │
+                            └───────────────┬──────────────┘
+                                            │ PySpark (local mode)
+                                            ▼
+  Simulated tick   ┌─────────┐   ┌──────────────────┐   ┌──────────────────────┐
+  stream    ─────▶ │  Kafka  │──▶│ Spark Structured │──▶│      Delta Lake      │
+  (synthetic)      │ (KRaft) │   │    Streaming     │   │  ohlcv_raw    bronze │
+                   └─────────┘   └──────────────────┘   │  ticks_raw    bronze │
+                                                        │  ohlcv_curated silver│
+                                                        └──────────┬───────────┘
+                                                                   │ delta-rs (no JVM)
+                        ┌──────────────────────────────────────────┤
+                        ▼                                          ▼
+              ┌───────────────────┐                      ┌───────────────────┐
+              │  RAG retrieval    │   retrieved context  │  FastAPI service  │
+              │  Chroma + Ollama  │ ───────────────────▶ │  OpenAPI /docs    │
+              │  nomic-embed-text │                      │  /metrics         │
+              └─────────┬─────────┘                      └─────────┬─────────┘
+                        │ grounded prompt                          │ HTTP only
+                        ▼                                          ▼
+              ┌───────────────────┐                      ┌───────────────────┐
+              │  Llama 3 (Ollama) │                      │ Streamlit console │
+              │  briefing ────────┼─▶ saved, re-indexed  │  (thin client)    │
+              └───────────────────┘                      └───────────────────┘
 
-           Prometheus + Grafana  ◀── batch duration, retrieval latency,
-                                      Kafka consumer lag, events/sec
+  Prometheus ◀── /metrics (API)   ◀── Pushgateway ◀── batch tasks + Spark consumer
+       │                                               (short-lived / no HTTP)
+       ▼
+   Grafana — pipeline health: lag, throughput, latency, batch duration, failures
 ```
 
-The intraday tick stream is a **simulated** synthetic event feed (a random walk
-around each ticker's last close), not a paid real-time market data subscription.
-This is deliberate and called out everywhere it matters.
+Two collection paths for metrics, because the components genuinely differ: the
+API is long-lived and serves HTTP so it is **scraped**; batch tasks exit in
+seconds and the Spark driver serves no HTTP at all, so they **push**.
 
-## Repo structure
+---
 
-```
-realtime-lakehouse-rag-pipeline/
-├── dags/
-│   └── market_pipeline_dag.py        # Airflow DAG: batch ingest -> transform (-> index in M3)
-├── src/
-│   ├── config.py                        # env-driven settings (paths, hosts, ports)
-│   ├── ingestion/fetch_market_data.py   # EOD OHLCV pull; ingest_to_delta() writes the raw Delta table
-│   ├── streaming/
-│   │   ├── tick_producer.py             # simulated intraday tick producer -> Kafka
-│   │   └── stream_consumer.py           # Spark Structured Streaming: Kafka -> ticks_raw Delta table
-│   ├── processing/transform_spark.py    # PySpark batch transforms -> curated Delta table
-│   ├── rag/
-│   │   ├── index_builder.py             # embeds + indexes docs/context + data/briefings into Chroma
-│   │   ├── retriever.py                 # retrieval step before every LLM call
-│   │   └── _chromadb_compat.py          # Windows onnxruntime/chromadb import-time fix
-│   ├── llm/briefing_generator.py        # Llama 3 via Ollama, retrieval-grounded, saves each briefing
-│   ├── observability/metrics.py         # Prometheus metrics + best-effort Pushgateway client
-│   └── api/
-│       ├── main.py                      # FastAPI service, OpenAPI docs enabled
-│       ├── schemas.py                   # Pydantic response models = the published contract
-│       └── lakehouse.py                 # Delta read layer (delta-rs, no Spark/JVM needed)
-├── ui/
-│   ├── streamlit_app.py             # internal analyst console — thin client, HTTP only
-│   └── api_client.py                # the console's HTTP client for the API
-├── monitoring/
-│   ├── prometheus.yml               # scrape config: api + pushgateway (honor_labels)
-│   └── grafana/                     # auto-provisioned datasource + Pipeline Health dashboard
-├── scripts/                         # CI step logic, runnable locally
-├── tests/                           # pytest: processing, streaming, rag, api, infra
-├── infra/
-│   ├── docker-compose.yml           # kafka + api + ui by default; streaming/orchestration behind profiles
-│   ├── Dockerfile.{api,ui,streaming,airflow}
-│   ├── requirements-{api,ui,streaming}.txt   # per-image deps; versions pinned by requirements.txt
-│   └── k8s/
-│       ├── kind-cluster.yaml     # local cluster: pinned node image, NodePort->host, lakehouse mount
-│       ├── deployment.yaml      # Namespace, ConfigMap, API + UI Deployments
-│       ├── service.yaml         # ClusterIP (in-cluster) + NodePort (host access)
-│       └── helm/rlrp/           # the same resources as a parameterised chart
-├── .github/workflows/ci.yml         # lint/test, image builds, compose e2e, kind smoke test
-├── data/raw/                        # baseline CSVs from the ported ingestion path (no longer read by the UI)
-├── data/delta/                      # Delta Lake tables: ohlcv_raw/ticks_raw (bronze), ohlcv_curated (silver) — gitignored
-├── data/briefings/                  # every briefing ever generated (frontmatter + text) — gitignored, grows locally
-├── data/vectorstore/                # Chroma persistent index — gitignored
-├── docs/context/                    # schema/ticker/methodology notes — real, committed, seeds the RAG index
-├── docs/METRICS.md                  # measured metrics log (no estimates)
-└── requirements.txt
-```
+## Measured results
 
-## Build milestones
+Selected headline figures. Full log, including how each was measured, in
+[docs/METRICS.md](docs/METRICS.md).
 
-- [x] **M1 — Orchestration + Lakehouse foundation.** Airflow DAG; Delta Lake tables; pandas transform ported to PySpark local mode.
-- [x] **M2 — Streaming ingestion.** Kafka (KRaft); simulated tick producer; Spark Structured Streaming consumer writing the same Delta tables.
-- [x] **M3 — RAG layer.** Local vector store; index past briefings/context; retrieval step before every LLM call.
-- [x] **M4 — Service split.** FastAPI service with OpenAPI docs; Streamlit becomes a thin client.
-- [x] **M5 — Containerization + deployment.** Dockerize API/UI/streaming; Kafka in docker-compose; k8s manifests / Helm deployed to a local `kind` cluster.
-- [x] **M6 — CI/CD + tests + observability.** pytest for batch/stream/retrieval; GitHub Actions lint/test/build/e2e/k8s; Prometheus + Grafana pipeline-health dashboard.
-- [ ] **M7 — Documentation + metrics capture.** README rewrite with architecture diagram and real measured numbers; every CV `[INSERT]` backed by a measurement.
+### Pipeline throughput
 
-## Running locally
+| Metric | Measured |
+|---|---|
+| Batch ingest → curated, end-to-end via Airflow | **~75s** (17 tickers, 406 rows) |
+| PySpark transform | **53.28s**, 406 rows in → 406 out |
+| Tick throughput published | **765 events in 45.05s** (16.98 events/sec) |
+| Tick delivery, end-to-end | **765/765 landed, 0 lost** across 17 micro-batches |
+| Kafka consumer lag | **max 136** during cold-start catch-up, **0** once caught up |
+| Streaming → Delta write latency | **p50 2.82s**, avg 4.84s (2s trigger interval) |
+| Containerised streaming | **918 new rows in 76s**, producer → Kafka → Spark → Delta |
 
-This repo is developed on an 8 GB Windows laptop with Docker Desktop (WSL2). The
-full stack does not fit in memory at once, so components are brought up in
-**subsets** (e.g. Kafka + streaming consumer + API together; Ollama separately).
-The literal "everything up at once" end-to-end proof runs in **CI**, where there
-is no local LLM load. Per-milestone run instructions are added as each lands.
+### Service latency
+
+| Endpoint | p50 | p95 |
+|---|---|---|
+| `GET /health` | 2.48 ms | 3.11 ms |
+| `GET /api/v1/tickers` | 2.25 ms | 2.58 ms |
+| `GET /api/v1/prices/{ticker}` | 24.26 ms | 26.98 ms |
+| `GET /api/v1/ticks/{ticker}` | 55.93 ms | 66.99 ms |
+| `GET /api/v1/lakehouse/stats` | 86.83 ms | 164.04 ms |
+
+50 real HTTP requests per endpoint against a running uvicorn. The same endpoints
+measured **3–6× slower** when containerised over a cross-OS bind mount — see
+[What broke](#what-broke-and-what-it-changed).
+
+### RAG
+
+| Metric | Measured |
+|---|---|
+| Retrieval latency (embed + vector search) | **4.49–5.47s** typical |
+| Index build (5 docs) | **12.14s**, 768-dim embeddings |
+| Briefing generation, warm | **65.6s / 92.6s** |
+| Briefing generation, cold (model load) | **480.3s** |
+| Local `llama3` throughput | **2.73 tok/s** generation |
+
+Generation is memory-bound, not pipeline-bound: `llama3` is a 4.7 GB model, while
+retrieval around it costs ~4.5s and the entire Delta read costs ~24 ms.
+
+### Deployment and operations
+
+| Metric | Measured |
+|---|---|
+| Container images | API **980 MB**, UI 1.09 GB, streaming 1.97 GB |
+| Compose stack cold start | **27s** to all-healthy |
+| Runtime memory, default stack | **~486 MB** (API 89, UI 46, Kafka 352) |
+| Kubernetes deploy (Helm) | install + upgrade to 2/2 replicas, **0 restarts** |
+| Cluster stability soak | **23 min continuous**, 21 samples, every one healthy |
+| Monitoring stack overhead | **~90 MB** (Grafana 55, Prometheus 25, Pushgateway 9) |
+| Full CI pipeline | **4.3 min** wall clock, 9.8 runner-minutes, 6 parallel jobs |
+| Test suite | **64 tests** |
+
+---
+
+## Quickstart
 
 ```bash
-python -m venv .venv && .venv\Scripts\activate   # Windows
+python -m venv .venv && .venv\Scripts\activate    # Windows
 pip install -r requirements.txt
 cp .env.example .env
 pytest -q
 ```
 
-### Milestone 1 — orchestration + Lakehouse foundation
-
-**Without Docker, ingestion only** (no JVM involved — pure Python/pandas/delta-rs;
-verified working on this machine, see [docs/METRICS.md](docs/METRICS.md)):
+Run the product surface:
 
 ```bash
-python -m src.ingestion.fetch_market_data   # -> data/delta/ohlcv_raw (append)
+cd infra
+docker compose up                                 # kafka + api + ui
 ```
 
-**Without Docker, the PySpark transform** — `python -m src.processing.transform_spark`
-— is implemented but **not currently runnable on this Windows machine**: the JVM
-driver spawns a Python worker subprocess that is silently killed within ~2 seconds
-with zero output (confirmed independent of this shell's own sandboxing, and a
-plain Python-spawned-Python child process survives fine — so it's specific to
-java.exe spawning python.exe here, most likely AV/EDR real-time protection
-intercepting that particular parent/child signature). Not worth chasing further
-locally: the transform runs correctly inside the Linux Airflow container below,
-where this Windows-only issue doesn't exist.
+- API + Swagger docs → <http://localhost:8000/docs>
+- Streamlit console → <http://localhost:8501>
 
-**With Airflow, for real** (the actual "Done when" criterion — verified via
-**WSL2**, not Docker: same Windows-worker issue as above ruled out Docker
-Desktop as the fast path here too, and `airflow dags test` runs the DAG through
-the real Airflow engine without needing the scheduler/webserver daemons):
+Add the optional stacks as needed:
 
 ```bash
-# One-time setup, inside WSL2 (Ubuntu):
-curl -LsSf https://astral.sh/uv/install.sh | sh          # standalone Python installer
-uv python install 3.12                                    # Ubuntu's own default python3 may be too new for pyspark/airflow
-uv venv --python 3.12 .venv && . .venv/bin/activate
-uv pip install -r requirements.txt
-uv pip install "apache-airflow==2.10.5" \
-    --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-2.10.5/constraints-3.12.txt"
-uv pip install "typing_extensions>=4.13"   # airflow's constraints pin 4.12.2, too old for pydantic_core's Sentinel
-
-# Run the DAG for real:
-export AIRFLOW_HOME=~/airflow_home
-export AIRFLOW__CORE__DAGS_FOLDER=$(pwd)/dags
-export AIRFLOW__CORE__LOAD_EXAMPLES=false
-export PYTHONPATH=$(pwd)
-airflow db migrate
-airflow dags test market_pipeline $(date +%F)
+docker compose --profile streaming up             # + tick producer and Spark consumer
+docker compose --profile monitoring up            # + prometheus, grafana, pushgateway
+docker compose --profile orchestration up         # + airflow
 ```
 
-**Verified**, 2026-09-03: both tasks (`ingest`, `transform`) SUCCESS, DagRun
-state `success`. Real numbers in [docs/METRICS.md](docs/METRICS.md).
+Services without a `profiles` key start by default. Spark and Airflow are the
+memory-hungry ones and stay opt-in.
 
-The `infra/Dockerfile.airflow` / `infra/docker-compose.yml` written for this
-milestone aren't wasted, just not the path used here: Docker Desktop wasn't
-installed on this machine, and WSL2 (needed either way — Docker Desktop's own
-backend on Windows *is* WSL2) got us to a real, verified Airflow run faster and
-lighter than also installing and configuring Docker Desktop on top. They fold
-into **Milestone 5**'s containerization work instead.
+---
 
-### Milestone 2 — streaming ingestion
+## How it works
 
-The intraday tick stream is entirely **simulated**: `tick_producer.py` generates
-a synthetic random walk per ticker (seeded from that ticker's latest known
-Close in the batch raw Delta table), not a paid real-time market data feed.
+### Batch — Airflow to Delta Lake
 
-**Design note** on "writes micro-batches into the same Delta tables the batch
-job uses": ticks (event-level) and the batch DAG's daily bars (one row per
-ticker per day) are different natural grains, so the streaming consumer writes
-its own bronze table, `data/delta/ticks_raw`, rather than unioning mismatched
-schemas into `ohlcv_raw` — real trading/risk platforms keep tick and bar tables
-separate for the same reason, sometimes compacting ticks into bars downstream.
-Both tables live in the same Lakehouse root (`data/delta/`), which is what
-"alongside the batch history" refers to.
+`dags/market_pipeline_dag.py` runs `ingest` then `transform`. Ingestion pulls
+OHLCV per ticker and **appends** to `data/delta/ohlcv_raw`, producing a new Delta
+version each run. The transform reads that table, computes 20/50-day SMAs, daily
+return and 20-day volatility per ticker in PySpark, and **overwrites**
+`data/delta/ohlcv_curated`.
 
-```bash
-# Kafka (KRaft mode, single broker) via Docker Engine in WSL2 - no Docker Desktop:
-docker compose -f infra/docker-compose.yml up -d kafka
+Delta I/O goes through `deltalake` (delta-rs) rather than Spark's own Delta
+connector — see [Design decisions](#design-decisions).
 
-# Pre-create the topic before starting either process. Spark's Kafka source
-# fails hard (UnknownTopicOrPartitionException, no retry) if the consumer
-# subscribes before the topic exists - found this the hard way.
-docker exec rlrp-kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 \
-    --create --topic market.ticks --partitions 1 --replication-factor 1 --if-not-exists
+### Streaming — Kafka to Spark to Delta
 
-# Two plain WSL2 processes, no Docker for these yet (containerized in M5):
-python -m src.streaming.stream_consumer --timeout 110 &   # start first - see note below
-sleep 20                                                  # let the query warm up
-python -m src.streaming.tick_producer --duration 45 --interval 1
-```
+`tick_producer.py` generates a synthetic random walk per ticker, seeded from that
+ticker's latest known close in the batch table, and publishes to Kafka (KRaft
+mode, no ZooKeeper). `stream_consumer.py` runs a Spark Structured Streaming query
+that parses the events and appends micro-batches to `data/delta/ticks_raw` on a
+2-second trigger, recording write latency and consumer lag after every batch.
 
-Start the consumer well before the producer: Spark Structured Streaming's query
-startup (Kafka source init, checkpoint bootstrap) is inconsistent on this
-machine - anywhere from ~1s to ~30-70s to commit its first micro-batch, not
-correlated with backlog size or a cold JAR cache. Once running, watch
-`data/delta/ticks_raw` grow while the producer is still active:
+Ticks and daily bars are **different natural grains**, so the consumer writes its
+own bronze table rather than unioning mismatched schemas into `ohlcv_raw`. Real
+trading and risk platforms keep tick and bar tables separate for the same reason.
 
-```bash
-python -c "from deltalake import DeltaTable; print(len(DeltaTable('data/delta/ticks_raw').to_pandas()))"
-```
+### RAG — retrieval before every LLM call
 
-**Verified**, 2026-09-04: 765 events published (17 tickers, 1/sec, 45s) → 765
-landed in `ticks_raw`, 0 lost, across 17 incremental Delta commits, while the
-producer was still running. Real throughput, consumer lag (max 136, final 0),
-and streaming-to-Delta write latency (p50 2.82s, close to the 2s trigger
-interval) in [docs/METRICS.md](docs/METRICS.md).
+`src/rag/index_builder.py` embeds and indexes two sources into a persistent
+Chroma collection: `docs/context/` (schema notes, ticker reference,
+methodology — real committed documentation) and `data/briefings/` (every
+briefing the pipeline has ever generated). `src/rag/retriever.py` runs before
+every generation, and the retrieved passages are injected into the prompt
+labelled by source, with an instruction to cite what was used.
 
-### Milestone 3 — RAG layer
+Because each briefing is saved and re-indexed, the corpus grows into itself:
+later retrievals surface earlier briefings alongside the static context docs.
 
-Local vector store: **Chroma** (persistent, `data/vectorstore/`). Embeddings:
-**Ollama's `nomic-embed-text`** (768-dim, ~274MB), not `sentence-transformers`
-— keeps the whole stack local/no-new-runtime and avoids pulling in torch
-(2GB+) on an 8 GB machine, consistent with the project's privacy-first story.
-
-The index covers two sources: `docs/context/` (schema notes, ticker
-reference, methodology/governance notes — real project documentation,
-committed to the repo) and `data/briefings/` (every briefing the pipeline has
-ever generated, saved automatically — gitignored, grows locally as you use
-it). `src/llm/briefing_generator.py` now always retrieves before generating:
-the retrieved passages are injected into the prompt, labeled by source, with
-an explicit instruction to cite what it actually draws on.
-
-```bash
-python -m src.rag.index_builder                    # build/refresh the index
-python -m src.rag.retriever "MSFT technical momentum"   # query it directly
-python -m src.llm.briefing_generator MSFT           # generate a grounded briefing
-```
-
-A Windows-specific wart, fixed: chromadb's `Collection` class evaluates its
-default (ONNX-based) embedding function as a class-level default argument at
-`import chromadb` time, which needs `onnxruntime` importable — but
-`onnxruntime`'s native extension reliably fails to load in the same process
-as `pandas`/`pyarrow` (a real DLL conflict, reproduced in isolation: either
-import alone works, the combination doesn't). Since this project always
-supplies its own embeddings explicitly and never touches chromadb's default,
-`src/rag/_chromadb_compat.py` pre-registers a dummy `onnxruntime` module
-before `chromadb` is ever imported, sidestepping the conflict entirely
-without needing the real package to actually work.
-
-**Verified**: see [docs/METRICS.md](docs/METRICS.md) for the real generated
-briefing, its cited sources, and measured retrieval/generation latency.
-
-### Milestone 4 — Service split
-
-The pipeline's outputs are now a documented HTTP API, and the Streamlit console
-is a thin client of it rather than a program that reads the filesystem.
+### Serving — FastAPI and a thin Streamlit client
 
 | Endpoint | Purpose |
 |---|---|
 | `GET /health` | Liveness — no lakehouse or model dependency |
 | `GET /api/v1/tickers` | The ingested portfolio |
-| `GET /api/v1/prices/{ticker}` | Curated daily bars + SMA/return/volatility from `ohlcv_curated` |
-| `GET /api/v1/ticks/{ticker}` | Streaming ticks landed by the Kafka consumer from `ticks_raw` |
+| `GET /api/v1/prices/{ticker}` | Curated bars + SMA/return/volatility |
+| `GET /api/v1/ticks/{ticker}` | Streaming ticks from `ticks_raw` |
 | `GET /api/v1/lakehouse/stats` | Row count + Delta version per table |
-| `POST /api/v1/briefings/{ticker}` | Retrieval-grounded briefing (POST: it runs a model and appends to the corpus) |
+| `POST /api/v1/briefings/{ticker}` | Retrieval-grounded briefing |
+| `GET /metrics` | Prometheus exposition (not in the OpenAPI contract) |
 
-```bash
-uvicorn src.api.main:app --reload      # API + Swagger UI at /docs
-streamlit run ui/streamlit_app.py      # thin client, talks HTTP only
-```
-
-Design decisions worth calling out:
-
-- **The read layer uses delta-rs, not Spark** (`src/api/lakehouse.py`). Serving
-  a few hundred rows over HTTP doesn't need a JVM, and it keeps the API
-  startable anywhere — including Windows, where PySpark local-mode task
-  execution is broken here. Spark stays in the batch transform, where the
-  distributed compute actually earns its cost.
-- **Responses are Pydantic models** (`src/api/schemas.py`), so `/openapi.json`
-  publishes a real contract a consumer can generate a client from — the point
-  of the milestone, not decoration. A test asserts every endpoint and the `Bar`
-  schema are present in the spec.
-- **A missing Delta table returns 503, not 500.** A pipeline that hasn't run
-  yet is an unready dependency, not a server bug, and `/lakehouse/stats`
-  degrades per-table rather than failing the whole request.
-- **The UI now plots the curated table.** Before M4 it read `data/raw/*.csv`
-  and recomputed its own rolling means, so it never actually displayed the
-  lakehouse's output; the SMA lines are now the ones PySpark computed.
+Responses are Pydantic models, so `/openapi.json` publishes a real contract a
+consumer can generate a client from. Briefings are `POST` because generation runs
+a model and appends to the corpus that later retrieval reads.
 
 #### Where the UI gets its data
 
@@ -305,213 +230,145 @@ deliberate:
 
 | Data | Source | Why |
 |---|---|---|
-| Prices, indicators, ticks, lakehouse status, briefings | **The API** | This is pipeline-backed data — it is ingested, versioned in Delta, and transformed. It must be served through the API so there is one read path, one contract, and one place where schema and freshness are defined. |
-| Analyst targets, earnings dates, income statement, news | **Yahoo Finance, directly** | This data never enters the Lakehouse. It is presentation-only, fetched live, and nothing downstream depends on it. |
+| Prices, indicators, ticks, lakehouse status, briefings | **The API** | Pipeline-backed — ingested, versioned in Delta, transformed. One read path, one contract, one place where schema and freshness are defined. |
+| Analyst targets, earnings, income statement, news | **Yahoo Finance, directly** | Never enters the Lakehouse. Presentation-only, fetched live, nothing downstream depends on it. |
 
-**The boundary: anything that enters the Lakehouse is served by the API;
-anything that never does may be fetched directly.** So the rule is not "the UI
-may call whatever is convenient" — a direct call is only legitimate for data
-the pipeline does not own. The moment fundamentals or news become
-pipeline-backed (ingested, stored, used to ground a briefing), they move behind
-the API like everything else. `tests/test_api.py` enforces the half that
-matters: the UI may not import the data or inference modules, and may not read
-data files.
+**The boundary: anything that enters the Lakehouse is served by the API; anything
+that never does may be fetched directly.** A direct call is only legitimate for
+data the pipeline does not own. If fundamentals ever become pipeline-backed, they
+move behind the API like everything else. `tests/test_api.py` enforces the half
+that matters — the UI may not import the data or inference modules, and may not
+read data files.
 
-**Verified**: real p50/p95 per endpoint in [docs/METRICS.md](docs/METRICS.md),
-measured over HTTP against a running server — plus a measured note on the
-full-scan read path the numbers exposed.
+### Deployment — Compose and Kubernetes
 
-### Milestone 5 — Containerization
-
-Every component now has an image, and the streaming producer/consumer move
-from plain WSL2 processes into containers. The Kubernetes/Helm half of this
-milestone is deliberately not started yet — see "Status" below.
+Four images (`api`, `ui`, `streaming`, `airflow`), each installing its own
+dependency set rather than the full `requirements.txt`. Kubernetes manifests and
+a Helm chart deploy the API and console to a local `kind` cluster:
 
 ```bash
-cd infra
-docker compose up                                       # kafka + api + ui
-docker compose --profile streaming up                   # + producer/consumer
-docker compose --profile orchestration up               # + airflow
-```
-
-Services without a `profiles` key start by default; Spark and Airflow are the
-memory-hungry ones and stay opt-in, because this is an 8 GB machine and
-bringing everything up at once is not the common case.
-
-**Dependencies are split per service** (`infra/requirements-*.txt`) rather than
-every image installing the top-level `requirements.txt`. That file remains the
-source of truth for *versions* — CI and the dev venv install it, so it is what
-the test suite actually runs against — while the per-service files only choose
-*which* of those packages an image needs. `tests/test_infra.py` enforces the
-relationship: every per-service package must exist in `requirements.txt` with
-an identical specifier, so the split can't silently drift into shipping a
-version CI never tested.
-
-The split is also a check on the architecture, not just a size optimisation:
-
-- The **UI image has no `deltalake`, `pyspark`, `chromadb` or `ollama`**. Since
-  M4 the console is a thin HTTP client, so if it ever regressed to reading data
-  or running inference directly, its container would fail outright.
-- The **API image has no `pyspark`, `streamlit` or `yfinance`**. It reads Delta
-  through delta-rs and needs no JVM.
-
-Two couplings this milestone exposed and fixed:
-
-- `src/api/main.py` imported `TICKERS` from `ingestion/fetch_market_data.py`,
-  pulling `yfinance` into the API image for a list of 17 strings. `TICKERS`
-  moved to `src/config.py`, where it belongs — it is configuration, not
-  ingestion logic.
-- `tick_producer` and `stream_consumer` default to **bounded** runs (30s/60s),
-  because Milestone 2 only ever needed verification runs. Under
-  `restart: unless-stopped` a bounded run is a restart loop, not a service, so
-  both now accept `0` to mean run-until-stopped and compose passes it
-  explicitly.
-
-Two container-only constraints worth knowing about, both found by running the
-stack rather than by reading the config:
-
-- **Spark checkpoints live on a named volume, not under `../data`.** Spark
-  chmods its checkpoint directory, which fails on a Windows-backed bind mount
-  as a non-root user. The named volume is also seeded with the image's
-  ownership of `/checkpoints`, which is why the Dockerfile creates and
-  `chown`s it — a volume that arrives root-owned stops Spark dead.
-- **The streaming image bakes the Kafka connector JARs.** `spark.jars.packages`
-  otherwise resolves them from Maven Central when the *query* starts, making
-  every cold container start depend on public internet access.
-
-Ollama is deliberately **not** containerized: it is a 4.7 GB model server that
-would dwarf this stack and is already installed natively. The API reaches it
-via the host gateway, which also requires `OLLAMA_HOST=0.0.0.0` on the host so
-it listens beyond loopback. Without that, every read endpoint works and only
-`POST /briefings` returns 502.
-
-**Verified** (see [docs/METRICS.md](docs/METRICS.md)): the default stack reaches
-all-healthy in 27s; the UI container fetches curated bars from the API over the
-compose network; and with the streaming profile up, **918 new tick rows landed
-in Delta in 76s** through the containerized producer → Kafka → Spark consumer
-path, read back through the API. Peak footprint is ~1.27 GB across five
-containers.
-
-#### Kubernetes (kind + Helm)
-
-The API and console also deploy to a real local Kubernetes cluster. Two paths
-are maintained — plain manifests for readability, a Helm chart for packaging —
-and a test asserts they agree on images and ports so they cannot drift.
-
-```bash
-# tooling (installs to ~/.local/bin, no sudo needed)
-# kubectl v1.37.0 / kind v0.33.0 / helm v4.2.4
-
 kind create cluster --config infra/k8s/kind-cluster.yaml
 kind load docker-image rlrp-api:local rlrp-ui:local --name rlrp   # no registry
 
-# either path:
-kubectl apply -f infra/k8s/deployment.yaml -f infra/k8s/service.yaml
-helm install rlrp infra/k8s/helm/rlrp -n rlrp --create-namespace --wait
+kubectl apply -f infra/k8s/deployment.yaml -f infra/k8s/service.yaml     # plain manifests
+helm install rlrp infra/k8s/helm/rlrp -n rlrp --create-namespace --wait  # or Helm
 ```
 
-Then `http://localhost:8000/docs` and `http://localhost:8501`.
+Both paths are maintained and a test asserts they agree on images and ports.
 
-Decisions worth calling out:
+> **WSL2 note.** This distro tears down its services when no process holds it
+> open, which stops Docker and kills the kind node. Hold it open first with a
+> long-lived background process (for example `sleep 86400`) inside the distro.
+> The failure is misleading — the *next* Docker operation fails with a
+> cgroup/systemd scope error that reads like a Docker cgroup-driver problem.
 
-- **The node image is pinned by digest.** kind's default node image changes
-  with every kind release, so an unpinned cluster silently changes Kubernetes
-  version when the tool is upgraded — the same drift class that broke the
-  streaming build when `python:3.12-slim` moved to Debian 13.
-- **`imagePullPolicy: IfNotPresent` everywhere.** These images exist only
-  locally (loaded with `kind load`); any policy that reaches out lands in
-  `ImagePullBackOff` against a registry that has never heard of `rlrp-api`.
-- **NodePort, not Ingress.** A single-node local cluster would need an ingress
-  controller installed, running and debugged to gain nothing here. The
-  NodePorts are paired with `extraPortMappings` so they surface on the host at
-  the same ports compose used.
-- **The chart takes its namespace from `.Release.Namespace`**, not a values
-  key — templating it separately lets the chart disagree with the `-n` flag it
-  is installed with.
-- **The UI Deployment mounts no volumes.** It is a thin HTTP client and its
-  image ships no `deltalake`/`pyspark`, so the k8s layer reflects the same
-  boundary the image enforces.
-
-One caveat about `kubectl apply --dry-run=server` on these manifests: it
-reports `namespaces "rlrp" not found`, because a server dry-run does not
-actually create the Namespace that the same file defines. That is a property
-of dry-run, not a defect in the manifests — the real apply succeeds.
-
-**Keeping the cluster alive on WSL2.** This distro tears its services down
-when no process holds it open, which stops Docker and takes the kind node with
-it — the node used to die within 1–3 minutes. Hold the distro open before
-creating the cluster:
+### Observability — Prometheus and Grafana
 
 ```bash
-wsl -d Ubuntu -- bash -lc 'sleep 86400' &   # or any long-lived process
+docker compose --profile monitoring up
 ```
 
-The failure this produces is misleading: the *next* Docker operation fails with
-a cgroup/systemd scope error, which reads like a Docker cgroup-driver problem
-rather than "the distro was shut down underneath you". See
-[docs/METRICS.md](docs/METRICS.md) for the evidence that distinguished them.
+Grafana <http://localhost:3000> (anonymous admin, local dev only) and Prometheus
+<http://localhost:9090>. The datasource and a 14-panel **Pipeline Health**
+dashboard are auto-provisioned, so the stack is useful the moment it starts.
 
-#### Status
-
-Docker/Compose and Kubernetes are both complete and verified against a real
-`kind` cluster, including a 20-minute soak test showing the cluster stays
-healthy rather than merely deploying fast. Nothing here is marked done on the
-strength of looking plausible — see [docs/METRICS.md](docs/METRICS.md) for what
-was measured.
-
-### Milestone 6 — CI/CD + observability
-
-**Metrics.** Three components need observing and none can be observed the same
-way, which is why there are two collection paths rather than one:
-
-| Component | How | Why |
-|---|---|---|
-| FastAPI service | scraped at `/metrics` | Long-lived and already serving HTTP |
-| Batch tasks (ingest, transform) | push to Pushgateway | An Airflow task that runs 60s and exits is never caught by a 15s scrape |
-| Streaming consumer | pushes after **every micro-batch** | A Spark driver serves no HTTP at all — and in run-until-stopped mode "the end of the run" never arrives, so end-of-run reporting would leave the lag panel empty forever |
-
-Every push is best-effort and swallows its own failures. A metrics backend
+Every metric push is best-effort and swallows its own failures. A metrics backend
 being down must not fail an ingestion run or kill a streaming query —
 observability that can take out the pipeline is worse than none.
 
-```bash
-docker compose --profile monitoring up      # prometheus + grafana + pushgateway
-```
+---
 
-- Grafana  <http://localhost:3000>  (anonymous admin, local dev only)
-- Prometheus <http://localhost:9090>
-- API metrics <http://localhost:8000/metrics>
+## Design decisions
 
-The datasource and the 14-panel **Pipeline Health** dashboard are
-auto-provisioned, so the stack is useful the moment it starts.
+**Delta I/O through delta-rs, not Spark's Delta connector.** On Windows the JVM
+`delta-spark` connector needs a version-matched JAR plus `winutils.exe` and
+`hadoop.dll` on `HADOOP_HOME`, a well-known source of breakage. Using delta-rs
+for the table boundary and PySpark purely for distributed computation keeps
+genuine Spark compute *and* genuine Delta versioning, schema enforcement and time
+travel, without the fragile Windows Hadoop setup.
 
-Two details that matter more than they look:
+**The API avoids Spark entirely.** Serving a few hundred rows over HTTP does not
+need a JVM, and avoiding it keeps the service startable anywhere — including
+Windows, where PySpark local-mode task execution is broken on this machine.
 
-- **The `endpoint` label is the route template**, not the raw path. Labelling
-  per-ticker would add a time series for every symbol — unbounded cardinality,
-  the standard way to overwhelm a Prometheus server. A test asserts this.
-- **`honor_labels: true` on the Pushgateway scrape.** Without it Prometheus
-  overwrites each pushed series' own `job` label with the scrape job's name,
-  collapsing batch and streaming metrics into one indistinguishable series.
+**A missing Delta table is 503, not 500.** A pipeline that has not run yet is an
+unready dependency, not a server fault. `/lakehouse/stats` degrades per-table
+rather than failing the whole request.
 
-**CI.** Four jobs, with the expensive three gated behind the cheap one and
-`cancel-in-progress` so superseded pushes don't burn minutes:
+**`API_BASE_URL` is separate from `API_HOST`/`API_PORT`.** One is what the client
+dials, the other is what the service binds. Keeping them separate is what let the
+UI move from `localhost` to `http://api:8000` (Compose) to
+`http://rlrp-api:8000` (Kubernetes) with configuration changes and no code
+changes.
 
-| Job | What it proves |
-|---|---|
-| `lint-and-test` | ruff + the full pytest suite |
-| `build-images` | all three images build; each contains what it should and **nothing it shouldn't** |
-| `compose-e2e` | Kafka → producer → Spark consumer → Delta, with rows that did not exist before, plus `/metrics` exposition |
-| `k8s-smoke` | Helm lint/render, deploy to a real kind cluster, UI→API over cluster DNS, and the upgrade path |
+**Dependencies are split per image.** Not primarily for size — the UI image
+(1.09 GB) is barely smaller than the API's (980 MB), since both are dominated by
+pandas/numpy/pyarrow. The value is architectural: the streaming image is the only
+one carrying a JVM, and the UI image ships no `deltalake`/`pyspark`/`chromadb`,
+so a regression to reading data directly fails at import inside the container
+instead of silently working in dev.
 
-Shell logic lives in `scripts/` rather than inline YAML, so each step is
-readable and runnable locally. The streaming check reads its baseline from the
-live API and **aborts if it cannot** — an earlier local version defaulted to
-zero on failure, which would have reported pre-existing rows as newly landed.
+**Metric labels use the route template, not the raw path.** Labelling
+`/api/v1/prices/MSFT` per-ticker would add a time series per symbol — unbounded
+cardinality, the standard way to overwhelm a Prometheus server.
 
-**Verified**: see [docs/METRICS.md](docs/METRICS.md) — 3/3 Prometheus targets
-up, 218 real requests recorded, batch metrics surviving the push path with
-their labels intact, and Grafana querying through its own datasource.
+**Base images and the kind node image are pinned.** `python:3.12-slim` floated to
+Debian 13 mid-project and dropped OpenJDK 17, breaking the streaming build; kind's
+default node image changes with every kind release. Both are now pinned, one by
+digest.
+
+---
+
+## What broke, and what it changed
+
+The failures were more instructive than the successes, and several only exist
+outside a developer's machine.
+
+**Four bugs that only exist inside a container.** The producer imported `TICKERS`
+from the ingestion module, dragging `yfinance` into an image that does not ship
+it (crash loop). Spark cannot `chmod` a checkpoint directory on a Windows bind
+mount. Named volumes arrive root-owned while the container runs as uid 10001. The
+producer logged nothing at all in run-until-stopped mode, making "is it
+publishing?" unanswerable. **Three of the four were green under "the container is
+`Up`"** — a crash-looping consumer reported `Up` the whole time.
+
+**A Rust panic that `except Exception` cannot catch.** delta-rs raises
+`pyo3_runtime.PanicException` for an unusable table location, and that inherits
+from `BaseException`. The API returned a 500 traceback instead of its designed
+503, and the producer crashed instead of falling back. This was a production bug,
+not a CI artefact — it never fired locally only because the directory always
+existed and was writable. The regression test is deliberate about this: a missing
+directory raises `TableNotFoundError`, an ordinary `Exception`, so tests using
+that pass with or without the fix. Only a `BaseException`-derived failure
+exercises the guard, and the test was confirmed to fail against the pre-fix code.
+
+**A dependency that existed everywhere except the image.** `prometheus-client`
+was added to `requirements.txt` but not to the API image's requirements. The dev
+venv and CI passed while the container had no metrics client — presenting as a
+Prometheus target stuck `down` with every panel empty, which reads like a scrape
+problem rather than a missing package.
+
+**A Windows workaround that turned into a 190 MB saving.** `chromadb` evaluates
+its default ONNX embedding function at import time, needing `onnxruntime`
+importable — but that native extension conflicts with pandas/pyspark in-process
+on Windows. Stubbing `sys.modules["onnxruntime"]` fixed the crash, and because
+the real package is then never needed, it could be dropped from the image
+entirely along with chromadb's unused `kubernetes` dependency.
+
+**The same endpoints are 3–6× slower containerised.** `lakehouse/stats` goes from
+86.83 ms to 492 ms p50. `/health`, which touches no storage, is *faster* in the
+container — which rules out the framework and runtime and points at the `/mnt/c`
+9p bind mount. It compounds the full-scan read path exactly as that model
+predicts.
+
+**A verification bug that nearly produced a false pass.** The streaming check
+originally read its baseline row count before starting the stack; the API was
+down, `curl` failed, and it fell back to `0` — which would have reported 765
+pre-existing rows as newly landed, "proving" containerised streaming worked
+without a single new row. A test whose baseline silently defaults to zero cannot
+fail. It now aborts instead.
+
+---
 
 ## Known limitations
 
@@ -519,45 +376,216 @@ Deliberate trade-offs, chosen with the cost understood and measured. They are
 listed because a design's boundaries are part of the design — not as a backlog.
 
 **The API read path scans whole tables.** `src/api/lakehouse.py` calls
-`DeltaTable(...).to_pandas()` and then filters by ticker and slices in pandas,
-so every request materialises the entire table regardless of how few rows it
-returns. The measurements show this plainly: `GET /prices/MSFT?limit=5` costs
-23.25ms p50 and `?limit=100` costs 24.26ms — essentially identical, because
+`DeltaTable(...).to_pandas()` and then filters in pandas, so every request
+materialises the entire table regardless of how few rows it returns. `?limit=5`
+costs 23.25 ms and `?limit=100` costs 24.26 ms — essentially identical, because
 latency tracks table size and Delta history depth rather than response size.
-The same code path takes 55.93ms against `ticks_raw` (765 rows, Delta version
-16) versus 24.26ms against `ohlcv_curated` (406 rows, version 0).
+Accepted at these volumes; it would not hold at production ones, where the fix is
+to push the predicate into the Parquet scan (`DeltaTable.to_pyarrow_dataset()`
+with a filter) or partition by `Ticker`. Stated so the numbers are not mistaken
+for evidence of an efficient read path.
 
-This is accepted at this project's data volumes: a few hundred rows per table
-makes the simple implementation comfortably fast, and it keeps the read layer
-JVM-free and easy to reason about. It would not hold at production volumes,
-where the fix is to push the predicate into the Parquet scan
-(`DeltaTable.to_pyarrow_dataset()` with a filter) or partition the tables by
-`Ticker` so a request touches only relevant files. Stated so the numbers above
-are not mistaken for evidence of an efficient read path.
+**Briefing generation is slow, and that is a hardware fact.** ~66–93s warm,
+~480s cold, because `llama3` is a 4.7 GB model that cannot stay resident here.
+The pipeline around it is not the bottleneck.
 
-**Briefing generation is slow on this hardware, and that is a hardware fact,
-not a pipeline one.** ~66-93s warm and ~480s cold, because `llama3` is a 4.7GB
-model on an 8GB machine where it cannot stay resident. The pipeline around it
-is not the bottleneck — retrieval is ~4.5s and the entire Delta read is
-~24ms. See [docs/METRICS.md](docs/METRICS.md) for the evidence behind that
-attribution.
+**Spark runs in local mode, and PySpark task execution does not work natively on
+Windows here.** The batch transform is verified in WSL2 and in CI instead; the
+API deliberately avoids Spark so the service itself stays portable. A
+dev-environment constraint, not a design limit.
 
-**Spark runs in local mode, and PySpark task execution does not work natively
-on Windows here.** The batch transform is verified in WSL2 and in CI instead;
-the API deliberately avoids Spark for reads so the service itself stays
-portable. This is a dev-environment constraint, not a design limit of the
-pipeline.
+**The tick stream is simulated.** A random walk seeded from real closes, not a
+market data subscription.
 
-## Measured metrics
+---
 
-All performance numbers live in [docs/METRICS.md](docs/METRICS.md), recorded as
-they are measured. The README metrics table is populated in M7 — no placeholders,
-no invented figures.
+## Running individual components
+
+<details>
+<summary><b>Batch pipeline (Airflow)</b></summary>
+
+Ingestion alone needs no JVM:
+
+```bash
+python -m src.ingestion.fetch_market_data      # -> data/delta/ohlcv_raw (append)
+```
+
+The PySpark transform is verified through the real Airflow engine in WSL2:
+
+```bash
+# One-time setup, inside WSL2 (Ubuntu):
+curl -LsSf https://astral.sh/uv/install.sh | sh
+uv python install 3.12
+uv venv --python 3.12 .venv && . .venv/bin/activate
+uv pip install -r requirements.txt
+uv pip install "apache-airflow==2.10.5" \
+    --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-2.10.5/constraints-3.12.txt"
+uv pip install "typing_extensions>=4.13"   # airflow pins 4.12.2, too old for pydantic_core
+
+export AIRFLOW_HOME=~/airflow_home
+export AIRFLOW__CORE__DAGS_FOLDER=$(pwd)/dags
+export AIRFLOW__CORE__LOAD_EXAMPLES=false
+export PYTHONPATH=$(pwd)
+airflow db migrate
+airflow dags test market_pipeline $(date +%F)
+```
+
+`airflow dags test` runs the DAG through the real engine — DAG parsing, task
+execution, XCom, DagRun state — without needing the scheduler/webserver daemons.
+</details>
+
+<details>
+<summary><b>Streaming (Kafka + Spark), without containers</b></summary>
+
+```bash
+docker compose -f infra/docker-compose.yml up -d kafka
+
+# Pre-create the topic. Spark's Kafka source fails hard
+# (UnknownTopicOrPartitionException, no retry) if the consumer subscribes
+# before the topic exists - found the hard way.
+docker exec rlrp-kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 \
+    --create --topic market.ticks --partitions 1 --replication-factor 1 --if-not-exists
+
+python -m src.streaming.stream_consumer --timeout 110 &   # start first
+sleep 20                                                  # let the query warm up
+python -m src.streaming.tick_producer --duration 45 --interval 1
+```
+
+Start the consumer well before the producer: query startup is inconsistent here,
+anywhere from ~1s to ~30-70s to commit its first micro-batch, uncorrelated with
+backlog size. Pass `0` to either `--duration`/`--timeout` to run until stopped —
+which is what the containers use.
+
+Watch rows land while the producer is still running:
+
+```bash
+python -c "from deltalake import DeltaTable; print(len(DeltaTable('data/delta/ticks_raw').to_pandas()))"
+```
+</details>
+
+<details>
+<summary><b>RAG and briefings</b></summary>
+
+```bash
+python -m src.rag.index_builder                        # build/refresh the index
+python -m src.rag.retriever "MSFT technical momentum"  # query it directly
+python -m src.llm.briefing_generator MSFT              # generate a grounded briefing
+```
+
+Vector store: Chroma (persistent, `data/vectorstore/`). Embeddings: Ollama's
+`nomic-embed-text` (768-dim), chosen over `sentence-transformers` to keep the
+stack local and avoid pulling ~2 GB of torch.
+
+Ollama is deliberately **not** containerised — a 4.7 GB model server would dwarf
+this stack and is already installed natively. The API reaches it via the host
+gateway, which also needs `OLLAMA_HOST=0.0.0.0` on the host. Without that, every
+read endpoint works and only `POST /briefings` returns 502.
+</details>
+
+<details>
+<summary><b>API and console, without containers</b></summary>
+
+```bash
+uvicorn src.api.main:app --reload     # API + Swagger UI at /docs
+streamlit run ui/streamlit_app.py     # thin client, talks HTTP only
+```
+</details>
+
+---
+
+## Repo structure
+
+```
+realtime-lakehouse-rag-pipeline/
+├── dags/market_pipeline_dag.py          # Airflow DAG: ingest -> transform
+├── src/
+│   ├── config.py                        # env-driven settings; the portfolio list
+│   ├── ingestion/fetch_market_data.py   # EOD OHLCV pull -> raw Delta table
+│   ├── processing/transform_spark.py    # PySpark indicators -> curated Delta table
+│   ├── streaming/
+│   │   ├── tick_producer.py             # simulated tick producer -> Kafka
+│   │   └── stream_consumer.py           # Spark Structured Streaming -> ticks_raw
+│   ├── rag/
+│   │   ├── index_builder.py             # embeds docs/context + data/briefings
+│   │   ├── retriever.py                 # retrieval step before every LLM call
+│   │   └── _chromadb_compat.py          # Windows onnxruntime/chromadb import fix
+│   ├── llm/briefing_generator.py        # Llama 3, retrieval-grounded, saves output
+│   ├── api/
+│   │   ├── main.py                      # FastAPI service, OpenAPI + /metrics
+│   │   ├── schemas.py                   # Pydantic models = the published contract
+│   │   └── lakehouse.py                 # Delta read layer (delta-rs, no JVM)
+│   └── observability/metrics.py         # metrics + best-effort Pushgateway client
+├── ui/
+│   ├── streamlit_app.py                 # analyst console - thin client, HTTP only
+│   └── api_client.py                    # its HTTP client
+├── infra/
+│   ├── docker-compose.yml               # kafka+api+ui default; others behind profiles
+│   ├── Dockerfile.{api,ui,streaming,airflow}
+│   ├── requirements-{api,ui,streaming}.txt   # per-image deps
+│   └── k8s/                             # kind config, manifests, Helm chart
+├── monitoring/
+│   ├── prometheus.yml                   # scrape config: api + pushgateway
+│   └── grafana/                         # provisioned datasource + dashboard
+├── scripts/                             # CI step logic, runnable locally
+├── tests/                               # api, infra, observability, processing, rag, streaming
+├── docs/
+│   ├── METRICS.md                       # every measured number, with method
+│   ├── CV_NUMBERS.md                    # CV-ready figures, each traced to a metric
+│   └── context/                         # committed docs that seed the RAG index
+├── data/                                # Delta tables, vector store, briefings - gitignored
+└── .github/workflows/ci.yml             # lint/test, image builds, compose e2e, kind
+```
+
+---
+
+## Continuous integration
+
+Six parallel jobs, **4.3 min** wall clock. The heavy ones are gated behind the
+cheap one so a lint failure fails fast, and `cancel-in-progress` stops superseded
+pushes burning minutes.
+
+| Job | What it proves |
+|---|---|
+| `lint-and-test` | ruff + the full 64-test suite |
+| `build-images` (x3) | Each image builds and contains what it should — **and nothing it shouldn't** |
+| `compose-e2e` | Kafka -> producer -> Spark consumer -> Delta, asserting rows that did not exist before, plus `/metrics` exposition |
+| `k8s-smoke` | Helm lint/render, deploy to a real kind cluster, UI->API over cluster DNS, upgrade path |
+
+Step logic lives in `scripts/` rather than inline YAML, so every step is readable
+and runnable locally.
+
+---
 
 ## Config & secrets
 
 All configuration is `.env`-based (`.env.example` is the template); nothing is
 hardcoded. In a real deployment: API keys and Kafka credentials would come from a
-secret manager (not `.env`), market/PII data handling would follow the firm's
-data-governance policy, and the vector store would be access-controlled. Kept
-explicit here as a governance-awareness note even though this is a solo project.
+secret manager rather than `.env`, market/PII data handling would follow the
+firm's data-governance policy, and the vector store would be access-controlled.
+Kept explicit as a governance-awareness note even though this is a solo project.
+
+---
+
+## Build milestones
+
+- [x] **M1 — Orchestration + Lakehouse foundation.** Airflow DAG; Delta Lake tables; pandas transform ported to PySpark.
+- [x] **M2 — Streaming ingestion.** Kafka (KRaft); simulated tick producer; Spark Structured Streaming consumer.
+- [x] **M3 — RAG layer.** Local vector store; index past briefings/context; retrieval before every LLM call.
+- [x] **M4 — Service split.** FastAPI with OpenAPI docs; Streamlit becomes a thin client.
+- [x] **M5 — Containerization + deployment.** Dockerised services; Kafka in compose; k8s manifests / Helm on a local `kind` cluster.
+- [x] **M6 — CI/CD + tests + observability.** Full CI pipeline; Prometheus + Grafana pipeline-health dashboard.
+- [x] **M7 — Documentation + metrics capture.** README rewrite; every claimed figure backed by a measurement.
+
+Each milestone landed in a working, committed, CI-passing state — one commit per
+milestone, linear history.
+
+---
+
+## Development environment
+
+Windows laptop, 12 GB RAM, with WSL2 (Ubuntu) hosting Docker, Kafka, Spark and
+Kubernetes. The full stack does not run comfortably all at once, so components
+are brought up in subsets locally; the literal everything-at-once proof runs in
+CI, where there is no local LLM load. Machine-specific constraints and the
+workarounds they forced are documented in [docs/METRICS.md](docs/METRICS.md)
+rather than hidden.
