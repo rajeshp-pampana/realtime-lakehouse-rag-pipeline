@@ -251,3 +251,102 @@ def test_ui_talks_to_the_api():
     }
     for call in ("get_tickers", "get_prices", "create_briefing"):
         assert call in api_imports, f"UI should use api_client.{call}"
+
+
+class _SimulatedPanic(BaseException):
+    """Stands in for ``pyo3_runtime.PanicException``.
+
+    The real class only exists once the pyo3 runtime has actually panicked, so
+    it cannot be imported to write a portable test against. What matters is its
+    one relevant property, reproduced here exactly: it derives from
+    BaseException rather than Exception, so `except Exception` does not catch
+    it.
+    """
+
+
+def test_delta_panic_is_503_not_an_uncaught_crash(tmp_path, monkeypatch):
+    """The BaseException fallback actually triggers - the real regression test.
+
+    CI hit this for real: the container (uid 10001) could not write the
+    bind-mounted data dir, delta-rs panicked, and because
+    pyo3_runtime.PanicException inherits from BaseException the
+    `except Exception` guard missed it. The API returned a 500 traceback
+    instead of the 503 it is designed to return.
+
+    Note what this does NOT rely on: a missing directory or a file-where-a-
+    directory-should-be both raise TableNotFoundError, which IS an Exception
+    subclass - tests using those pass with or without the fix and prove
+    nothing. Only a BaseException-derived failure exercises the guard.
+    """
+    import deltalake
+
+    def panic(*_args, **_kwargs):
+        raise _SimulatedPanic(
+            'The specified table_uri is not valid: InvalidTableLocation('
+            '"Could not create local directory: /app/data/delta/ohlcv_curated")'
+        )
+
+    monkeypatch.setattr(deltalake, "DeltaTable", panic)
+    monkeypatch.setattr(config, "DELTA_OHLCV_CURATED", str(tmp_path / "whatever"))
+
+    response = client.get("/api/v1/prices/MSFT")
+
+    assert response.status_code == 503, (
+        f"a delta-rs panic must degrade to 503, got {response.status_code}. "
+        f"If this is a 500 or the exception escaped, the BaseException guard "
+        f"in src/api/lakehouse.py has regressed to `except Exception`."
+    )
+    assert "not available yet" in response.json()["detail"]
+
+
+def test_keyboard_interrupt_is_never_swallowed(tmp_path, monkeypatch):
+    """Catching BaseException must not turn Ctrl-C into a 503.
+
+    The broad guard is deliberate but narrow: KeyboardInterrupt and SystemExit
+    have to keep propagating, or the process becomes unkillable mid-request.
+    """
+    import deltalake
+
+    from src.api import lakehouse
+
+    def interrupt(*_args, **_kwargs):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(deltalake, "DeltaTable", interrupt)
+
+    with pytest.raises(KeyboardInterrupt):
+        lakehouse.get_prices("MSFT", table_path=str(tmp_path / "x"))
+
+
+def test_unreadable_table_path_is_503_not_a_500_traceback(tmp_path, monkeypatch):
+    """A file where a table directory should be also degrades to 503.
+
+    This one goes through TableNotFoundError (an ordinary Exception), so it
+    covers the common case rather than the panic path above.
+    """
+    not_a_directory = tmp_path / "definitely_not_a_table"
+    not_a_directory.write_text("this is a file, not a Delta table", encoding="utf-8")
+
+    monkeypatch.setattr(config, "DELTA_OHLCV_CURATED", str(not_a_directory))
+    response = client.get("/api/v1/prices/MSFT")
+
+    assert response.status_code == 503, (
+        f"expected 503 for an unusable table path, got {response.status_code}"
+    )
+    assert "not available yet" in response.json()["detail"]
+
+
+def test_lakehouse_stats_survives_an_unusable_table_path(tmp_path, monkeypatch):
+    """One broken table must degrade its own entry, not fail the request."""
+    broken = tmp_path / "broken_table"
+    broken.write_text("not a table", encoding="utf-8")
+
+    monkeypatch.setattr(config, "DELTA_OHLCV_RAW", str(broken))
+    monkeypatch.setattr(config, "DELTA_OHLCV_CURATED", str(tmp_path / "missing"))
+    monkeypatch.setattr(config, "DELTA_TICKS_RAW", str(tmp_path / "missing2"))
+
+    response = client.get("/api/v1/lakehouse/stats")
+    assert response.status_code == 200
+    tables = {t["name"]: t for t in response.json()["tables"]}
+    assert tables["ohlcv_raw"]["available"] is False
+    assert tables["ohlcv_raw"]["detail"]

@@ -60,3 +60,11 @@ API_BASE_URL = os.environ.get("API_BASE_URL", "http://localhost:8000")
 # that, not the usual few seconds.
 API_TIMEOUT_SECONDS = float(os.environ.get("API_TIMEOUT_SECONDS", "30"))
 API_BRIEFING_TIMEOUT_SECONDS = float(os.environ.get("API_BRIEFING_TIMEOUT_SECONDS", "900"))
+
+# --- Observability (Milestone 6) ---
+# Short-lived batch tasks and the non-HTTP streaming consumer cannot be
+# scraped, so they push to a Pushgateway instead. Empty disables pushing
+# entirely, which is the default for a plain local run - nothing should require
+# a metrics stack to be up just to ingest data.
+PUSHGATEWAY_URL = os.environ.get("PUSHGATEWAY_URL", "")
+METRICS_ENABLED = os.environ.get("METRICS_ENABLED", "true").lower() in ("1", "true", "yes")

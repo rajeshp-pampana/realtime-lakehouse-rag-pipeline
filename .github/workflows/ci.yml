@@ -5,8 +5,15 @@ on:
     branches: ["**"]
   pull_request:
 
+# A newer push makes an in-flight run for the same ref pointless. The heavier
+# jobs below cost real minutes, so cancel rather than queue them.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   lint-and-test:
+    name: Lint + unit tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -33,5 +40,159 @@ jobs:
       - name: Tests (pytest)
         run: pytest -q
 
-  # Milestone 6 expands this workflow with: Docker image builds, the full
-  # docker-compose end-to-end run, and a kind-based `kubectl apply` smoke test.
+  build-images:
+    name: Build image (${{ matrix.service }})
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - service: api
+            dockerfile: infra/Dockerfile.api
+            tag: rlrp-api:local
+          - service: ui
+            dockerfile: infra/Dockerfile.ui
+            tag: rlrp-ui:local
+          - service: streaming
+            dockerfile: infra/Dockerfile.streaming
+            tag: rlrp-streaming:local
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build ${{ matrix.service }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          tags: ${{ matrix.tag }}
+          load: true
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+      - name: Image size
+        run: docker images ${{ matrix.tag }}
+
+      # Guards the architectural claims these images exist to enforce.
+      # Milestone 5 found violations of them only by running containers by
+      # hand; CI checks them on every push now.
+      - name: Verify image contents
+        run: python scripts/ci_verify_image.py ${{ matrix.service }} ${{ matrix.tag }}
+
+  compose-e2e:
+    name: Compose end-to-end (Kafka -> Spark -> Delta)
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build api + streaming images
+        run: |
+          docker build -f infra/Dockerfile.api -t rlrp-api:local .
+          docker build -f infra/Dockerfile.streaming -t rlrp-streaming:local .
+
+      - name: Seed a curated Delta table for the API to serve
+        run: |
+          python -m pip install --upgrade pip
+          pip install "pandas>=2.2,<2.3" "deltalake>=0.21,<0.25" "pyarrow>=17,<19"
+          python scripts/ci_seed_curated.py
+          # The images run as uid 10001 while the runner checkout is owned by
+          # the runner user, so the bind-mounted data dir is not writable by the
+          # containers. delta-rs surfaces that as a Rust panic, not a tidy
+          # error. Runner-local throwaway directory, hence the broad mode.
+          mkdir -p data/delta data/briefings data/vectorstore
+          chmod -R a+rwX data
+
+      - name: Start Kafka, API and the streaming pair
+        working-directory: infra
+        run: |
+          docker compose up -d kafka api
+          docker compose --profile streaming up -d tick-producer stream-consumer
+          docker compose ps
+
+      - name: Wait for the API
+        run: bash scripts/ci_wait_for_api.sh
+
+      - name: API serves the curated table and exposes metrics
+        run: bash scripts/ci_check_api.sh
+
+      # The real streaming proof: rows that did not exist before the producer
+      # and consumer containers started must appear in the Delta table.
+      - name: Ticks flow producer -> Kafka -> Spark -> Delta
+        run: bash scripts/ci_wait_for_ticks.sh
+
+      - name: Dump logs on failure
+        if: failure()
+        working-directory: infra
+        run: docker compose --profile streaming logs --tail 80
+
+      - name: Tear down
+        if: always()
+        working-directory: infra
+        run: docker compose --profile streaming down -v
+
+  k8s-smoke:
+    name: Kubernetes smoke test (kind)
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: rlrp
+          # The kind binary and the node image must be a matching pair. The
+          # action defaults to kind v0.31.0, which emits kubeadm.k8s.io/v1beta3
+          # config that a v1.37.0 node image's kubeadm rejects outright
+          # ("your configuration file uses an old API spec"). Pin both, and to
+          # the same versions used locally.
+          version: v0.33.0
+          # Matches the digest-pinned version in infra/k8s/kind-cluster.yaml.
+          # That file also mounts a host lakehouse path which does not exist on
+          # a runner, so the cluster is created without it here and the chart is
+          # pointed at a path that does exist.
+          node_image: kindest/node:v1.37.0
+
+      - name: Build and load images
+        run: |
+          docker build -f infra/Dockerfile.api -t rlrp-api:local .
+          docker build -f infra/Dockerfile.ui -t rlrp-ui:local .
+          kind load docker-image rlrp-api:local rlrp-ui:local --name rlrp
+
+      - name: Lint and render the Helm chart
+        run: |
+          helm lint infra/k8s/helm/rlrp
+          helm template rlrp infra/k8s/helm/rlrp -n rlrp > /tmp/rendered.yaml
+          grep -c "^kind:" /tmp/rendered.yaml
+
+      - name: Deploy via Helm
+        run: |
+          helm install rlrp infra/k8s/helm/rlrp -n rlrp --create-namespace --set lakehouse.hostPath=/tmp --wait --timeout 6m
+          kubectl -n rlrp get pods -o wide
+
+      - name: Both Deployments are available
+        run: |
+          kubectl -n rlrp rollout status deploy/rlrp-api --timeout=120s
+          kubectl -n rlrp rollout status deploy/rlrp-ui --timeout=180s
+
+      # The service split's core claim, checked in-cluster: the UI reaches the
+      # API by Service name, exactly as it does under compose.
+      - name: UI pod reaches the API over cluster DNS
+        run: bash scripts/ci_ui_reaches_api.sh
+
+      - name: Helm upgrade path works
+        run: |
+          helm upgrade rlrp infra/k8s/helm/rlrp -n rlrp --set lakehouse.hostPath=/tmp --set api.replicaCount=2 --wait --timeout 4m
+          kubectl -n rlrp get deploy rlrp-api
+          helm history rlrp -n rlrp
+
+      - name: Dump diagnostics on failure
+        if: failure()
+        run: |
+          kubectl -n rlrp get pods -o wide || true
+          kubectl -n rlrp describe pods || true
+          kubectl -n rlrp logs -l app.kubernetes.io/component=api --tail 60 || true
+          kubectl -n rlrp logs -l app.kubernetes.io/component=ui --tail 60 || true

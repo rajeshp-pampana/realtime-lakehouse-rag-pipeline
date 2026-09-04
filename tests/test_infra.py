@@ -449,3 +449,117 @@ def test_chart_templates_namespace_from_the_release():
             f"{template.name} templates .Values.namespace; use .Release.Namespace "
             f"so the chart cannot disagree with the -n flag"
         )
+
+
+# --- CI workflow (Milestone 6) ----------------------------------------------
+
+WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+
+
+def _workflow() -> dict:
+    import yaml
+
+    return yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+
+
+def test_ci_references_only_scripts_that_exist():
+    """A CI step calling a missing script fails only when that job runs.
+
+    With image builds and cluster tests behind `needs:`, that can be ten minutes
+    into a run - and only on the branch that pushed. Cheap to check here.
+    """
+    import re
+
+    body = WORKFLOW.read_text(encoding="utf-8")
+    referenced = set(re.findall(r"scripts/[A-Za-z0-9_.-]+", body))
+    assert referenced, "expected the workflow to call scripts/"
+
+    missing = sorted(s for s in referenced if not (REPO_ROOT / s).is_file())
+    assert not missing, f"ci.yml references scripts that do not exist: {missing}"
+
+
+def test_ci_covers_the_full_stack():
+    """The README claims the full-stack proof runs in CI; keep that true."""
+    jobs = _workflow()["jobs"]
+    for expected in ("lint-and-test", "build-images", "compose-e2e", "k8s-smoke"):
+        assert expected in jobs, f"CI is missing the {expected} job"
+
+
+def test_heavy_ci_jobs_wait_for_the_cheap_one():
+    """Building three images before ruff has run wastes minutes on a typo."""
+    jobs = _workflow()["jobs"]
+    for heavy in ("build-images", "compose-e2e", "k8s-smoke"):
+        assert jobs[heavy].get("needs") == "lint-and-test", (
+            f"{heavy} should depend on lint-and-test so a lint failure fails fast"
+        )
+
+
+def test_ci_cancels_superseded_runs():
+    """These jobs are expensive; queueing runs for stale commits burns minutes."""
+    workflow = _workflow()
+    concurrency = workflow.get("concurrency")
+    assert concurrency, "expected a concurrency group"
+    assert concurrency.get("cancel-in-progress") is True
+
+
+def test_image_requirements_cover_what_the_code_imports():
+    """Adding a dependency to requirements.txt does not put it in an image.
+
+    This gap was real: `prometheus-client` was added to requirements.txt and the
+    API code imported it, but infra/requirements-api.txt was not updated - so the
+    dev venv and CI were fine while the container had no metrics client at all.
+    The symptom was a Prometheus target stuck `down` with every panel empty,
+    which looks like a scrape/config problem rather than a missing package.
+
+    Only the modules each image actually runs are scanned. The API image copies
+    all of src/, but never imports the Spark or Kafka code, so requiring pyspark
+    in the API image would be wrong.
+    """
+    import ast
+
+    # import name -> distribution name in the requirements files
+    DISTRIBUTION = {
+        "fastapi": "fastapi",
+        "uvicorn": "uvicorn",
+        "pydantic": "pydantic",
+        "pandas": "pandas",
+        "pyarrow": "pyarrow",
+        "deltalake": "deltalake",
+        "chromadb": "chromadb",
+        "ollama": "ollama",
+        "prometheus_client": "prometheus-client",
+        "httpx": "httpx",
+        "streamlit": "streamlit",
+        "plotly": "plotly",
+        "yfinance": "yfinance",
+        "dotenv": "python-dotenv",
+        "kafka": "kafka-python-ng",
+        "pyspark": "pyspark",
+    }
+
+    # (requirements file, source trees that image actually executes)
+    IMAGE_SCOPE = {
+        "requirements-api.txt": ["src/api", "src/observability", "src/rag", "src/llm"],
+        "requirements-streaming.txt": ["src/streaming", "src/observability"],
+        "requirements-ui.txt": ["ui"],
+    }
+
+    for req_file, trees in IMAGE_SCOPE.items():
+        declared = set(_parse(INFRA / req_file))
+        imported: set[str] = set()
+
+        for tree in trees:
+            for path in (REPO_ROOT / tree).rglob("*.py"):
+                parsed = ast.parse(path.read_text(encoding="utf-8"))
+                for node in ast.walk(parsed):
+                    if isinstance(node, ast.Import):
+                        imported.update(a.name.split(".")[0] for a in node.names)
+                    elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+                        imported.add(node.module.split(".")[0])
+
+        needed = {DISTRIBUTION[m] for m in imported if m in DISTRIBUTION}
+        missing = sorted(needed - declared)
+        assert not missing, (
+            f"{req_file} is missing packages its code imports: {missing}. "
+            f"The dev venv and CI would pass while the container fails at import."
+        )

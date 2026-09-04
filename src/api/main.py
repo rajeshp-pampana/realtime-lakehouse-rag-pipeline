@@ -17,8 +17,11 @@ then browse ``http://localhost:8000/docs``.
 
 from __future__ import annotations
 
-from fastapi import FastAPI, HTTPException, Path, Query
-from fastapi.responses import JSONResponse
+import time
+
+from fastapi import FastAPI, HTTPException, Path, Query, Request
+from fastapi.responses import JSONResponse, Response
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from src import config
 from src.api import lakehouse
@@ -32,6 +35,7 @@ from src.api.schemas import (
     TicksResponse,
 )
 from src.config import TICKERS
+from src.observability import metrics
 
 API_VERSION = "1.0.0"
 V1 = "/api/v1"
@@ -55,6 +59,49 @@ app = FastAPI(
         {"name": "briefings", "description": "Retrieval-grounded LLM briefings."},
     ],
 )
+
+
+@app.middleware("http")
+async def record_request_metrics(request: Request, call_next):
+    """Count and time every request.
+
+    Labels use the *route template* (`/api/v1/prices/{ticker}`), not the raw
+    path. Labelling by raw path would create a new time series per ticker -
+    unbounded cardinality, the classic way to melt a Prometheus server.
+    """
+    started = time.perf_counter()
+    try:
+        response = await call_next(request)
+        status = response.status_code
+    except Exception:
+        metrics.API_REQUESTS.labels(request.method, _route_of(request), "500").inc()
+        metrics.API_REQUEST_SECONDS.labels(request.method, _route_of(request)).observe(
+            time.perf_counter() - started
+        )
+        raise
+
+    endpoint = _route_of(request)
+    metrics.API_REQUESTS.labels(request.method, endpoint, str(status)).inc()
+    metrics.API_REQUEST_SECONDS.labels(request.method, endpoint).observe(
+        time.perf_counter() - started
+    )
+    return response
+
+
+def _route_of(request: Request) -> str:
+    """The matched route template, or ``unmatched`` for 404s on unknown paths."""
+    route = request.scope.get("route")
+    return getattr(route, "path", None) or "unmatched"
+
+
+@app.get("/metrics", tags=["meta"], include_in_schema=False)
+def prometheus_metrics() -> Response:
+    """Prometheus exposition endpoint.
+
+    Excluded from the OpenAPI schema: it is an operational surface for the
+    scraper, not part of the product contract consumers generate clients from.
+    """
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.exception_handler(lakehouse.TableUnavailableError)

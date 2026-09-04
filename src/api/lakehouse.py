@@ -29,10 +29,18 @@ def _load(table_path: str) -> tuple[Any, int]:
 
     try:
         table = DeltaTable(table_path)
-    except Exception as exc:  # delta-rs raises TableNotFoundError and friends
+    except BaseException as exc:
+        # BaseException, not Exception, and deliberately so: delta-rs is a Rust
+        # extension, and for an unreadable or uncreatable table location it
+        # raises pyo3_runtime.PanicException, which inherits from BaseException.
+        # `except Exception` silently misses it - CI caught this when the
+        # container (uid 10001) could not write the bind-mounted data dir and
+        # the API returned a 500 traceback instead of the intended 503.
+        if isinstance(exc, KeyboardInterrupt | SystemExit):
+            raise
         raise TableUnavailableError(
             f"Delta table '{table_path}' is not available yet - run the pipeline first "
-            f"({exc.__class__.__name__})"
+            f"({exc.__class__.__name__}: {exc})"
         ) from exc
     return table.to_pandas(), table.version()
 

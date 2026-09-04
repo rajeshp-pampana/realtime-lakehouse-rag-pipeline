@@ -22,7 +22,8 @@
 #   docker compose up                                        # kafka + api + ui
 #   docker compose --profile streaming up                    # + producer/consumer
 #   docker compose --profile orchestration up                # + airflow
-#   docker compose --profile streaming --profile orchestration up   # everything
+#   docker compose --profile monitoring up                   # + prometheus/grafana
+#   docker compose --profile streaming --profile monitoring up      # the useful pair
 #
 # The default set (kafka, api, ui) is the product surface plus the broker it
 # will need, and fits comfortably. Spark and Airflow are the memory-hungry
@@ -48,6 +49,9 @@ x-streaming: &streaming
     # startup. A named volume is a real Linux filesystem, and checkpoints are
     # runtime state rather than user data, so this is where they belong anyway.
     STREAM_CHECKPOINT_DIR: "/checkpoints/ticks_stream"
+    # The Spark driver serves no HTTP, so nothing can scrape it - it pushes
+    # after every micro-batch instead.
+    PUSHGATEWAY_URL: "pushgateway:9091"
   volumes:
     - ../data:/app/data
     - stream-checkpoints:/checkpoints
@@ -113,6 +117,9 @@ services:
       # beyond loopback (OLLAMA_HOST=0.0.0.0 on the host). Without that, the
       # read endpoints all work and only POST /briefings returns 502.
       OLLAMA_HOST: "http://host.docker.internal:11434"
+      # The API is scraped at /metrics rather than pushing, but batch tasks run
+      # in other containers with the same image family and do push.
+      PUSHGATEWAY_URL: "pushgateway:9091"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
@@ -180,8 +187,57 @@ services:
       retries: 5
     profiles: ["orchestration"]
 
+  # --- Observability (Milestone 6) -----------------------------------------
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    container_name: rlrp-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ../monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      # Short retention on purpose: this is a laptop, and the dashboard's
+      # longest window is an hour.
+      - "--storage.tsdb.retention.time=7d"
+    restart: unless-stopped
+    profiles: ["monitoring"]
+
+  pushgateway:
+    image: prom/pushgateway:v1.11.0
+    container_name: rlrp-pushgateway
+    ports:
+      - "9091:9091"
+    restart: unless-stopped
+    profiles: ["monitoring"]
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    container_name: rlrp-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      # Local dev only. Anonymous admin access means the dashboard is useful
+      # the moment it starts; this is not a deployment posture.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_USERS_DEFAULT_THEME: "dark"
+    volumes:
+      - ../monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    profiles: ["monitoring"]
+
 volumes:
   airflow-state:
+  prometheus-data:
+  grafana-data:
   # Spark Structured Streaming checkpoints. Deliberately a named volume rather
   # than a host bind mount - see STREAM_CHECKPOINT_DIR above.
   stream-checkpoints:

@@ -1,11 +1,42 @@
-# Prometheus scrape config. Populated in Milestone 6.
-# Targets will include: the FastAPI service (/metrics), the streaming consumer
-# (Kafka consumer lag, events/sec), and batch job push-gateway metrics.
+# Prometheus scrape configuration.
+#
+# Three sources, because the pipeline's components can't all be scraped the
+# same way:
+#
+#  - api           : long-lived and already serving HTTP -> scraped directly.
+#  - pushgateway   : where the short-lived batch tasks (ingest, transform) and
+#                    the streaming consumer push. An Airflow task that runs for
+#                    a minute and exits is never caught by a 15s scrape, and the
+#                    Spark driver serves no HTTP at all.
+#  - prometheus    : itself, so the monitoring stack's own health is visible.
 
 global:
   scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    project: realtime-lakehouse-rag-pipeline
 
 scrape_configs:
-  - job_name: placeholder
+  - job_name: api
+    metrics_path: /metrics
     static_configs:
-      - targets: []
+      - targets: ["api:8000"]
+        labels:
+          component: api
+
+  - job_name: pushgateway
+    # honor_labels is essential here: without it Prometheus overwrites the
+    # pushed series' own `job` label ("rlrp_batch_ingest", "rlrp_stream_consumer")
+    # with this scrape job's name, collapsing every pushing component into one
+    # indistinguishable series.
+    honor_labels: true
+    static_configs:
+      - targets: ["pushgateway:9091"]
+        labels:
+          component: jobs
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+        labels:
+          component: monitoring

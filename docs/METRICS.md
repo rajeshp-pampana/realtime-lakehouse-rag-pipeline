@@ -45,7 +45,13 @@ placeholder in the CV Projects section.
 | **kind cluster stability (soak test)** | **23 min continuous, 0 pod restarts** - 21 samples at 60s intervals, every one healthy | 2026-09-04 | Sampled node status, pod readiness, `/health`, UI HTTP and restart counts every 60s for 20 min. Final state: 3/3 pods Running (ages 20-21m), helm release still `deployed` at revision 2, API still serving real curated MSFT bars. `dockerd` showed `NRestarts=0` throughout, confirming the distro was never torn down. Before the keep-alive fix the node died within 1-3 minutes | M5 |
 | **kind cluster creation** | **~60-90s** to Ready (node image ~1 GB, pulled once) | 2026-09-04 | `kind create cluster --config infra/k8s/kind-cluster.yaml` | M5 |
 | **`kind load docker-image`** | **48s (api), 57s (ui)** | 2026-09-04 | Required because there is no registry; images are 227 MB / 217 MB as stored by containerd in the node | M5 |
-| CI pipeline duration (lint + test + build) | _tbd_ | | | M6 |
+| **Prometheus scrape, all targets** | **3/3 targets `up`** (api, pushgateway, prometheus) | 2026-09-04 | `GET /api/v1/targets` on the running stack after `docker compose --profile monitoring up` | M6 |
+| **Metrics actually collected** | **218 API requests recorded**, split `/health`=50, `/api/v1/prices/{ticker}`=120, `/api/v1/lakehouse/stats`=40, `/metrics`=8; by status `200`=178, `404`=40 | 2026-09-04 | Real traffic (200 requests over 5 endpoint shapes incl. deliberate 404s), then queried out of Prometheus. The 120 prices requests span MSFT, NVDA and a bogus ticker but collapse into **one** series - the endpoint label is the route template, so cardinality does not grow with the portfolio | M6 |
+| **Pushgateway path (batch jobs)** | **5 pushed series, `job` label preserved**: `rlrp_ingest_rows`=406, `rlrp_ingest_duration_seconds`=7.96, `rlrp_ingest_tickers_ok`=17, `rlrp_ingest_tickers_failed`=0, `rlrp_ingest_table_version`=1, all with `job="rlrp_batch_ingest"` | 2026-09-04 | Pushed from inside the API container, scraped by Prometheus. The preserved `job` label confirms `honor_labels: true` is working - without it every pushing component collapses into one indistinguishable series | M6 |
+| **Grafana end to end** | **Datasource + dashboard auto-provisioned; Grafana queried Prometheus and received `218`** | 2026-09-04 | `POST /api/ds/query` through Grafana's own provisioned datasource (uid `PBFA97CFB590B2093`), dashboard `Pipeline Health` (uid `rlrp-pipeline-health`) | M6 |
+| **Monitoring stack memory** | **~90 MB total**: Grafana 55.4 MB, Prometheus 24.7 MB, Pushgateway 9.4 MB | 2026-09-04 | `docker stats --no-stream`. Cheap enough to leave running alongside the pipeline | M6 |
+| **API latency, containerized over a 9p bind mount** | `/health` **p50 1.25ms / p95 2.4ms**; `/api/v1/prices/{ticker}` **p50 75.9ms / p95 99.1ms**; `/api/v1/lakehouse/stats` **p50 492ms / p95 948ms** | 2026-09-04 | Prometheus `histogram_quantile` over the live histogram, 218 real requests. **Notably slower than the M4 figures** (24.26ms and 86.83ms p50) measured on Windows-native uvicorn - see the note below on why | M6 |
+| **CI pipeline duration (full: lint/test + 3 image builds + compose e2e + kind)** | **4.3 min wall clock**, 9.8 runner-minutes across 6 parallel jobs | 2026-09-04 | GitHub Actions run 33900808032, job start/complete timestamps. Breakdown: kind smoke 190s, compose e2e 156s, lint+test 67s, image builds 50-67s each (with `type=gha` layer cache). Materially cheaper than the 10-20 min estimated before measuring, because the heavy jobs run in parallel once `lint-and-test` passes | M6 |
 
 ## Milestone 3 "Done when" proof: a briefing citing retrieved context
 
@@ -236,6 +242,35 @@ Two smaller things worth knowing:
 - `/tmp` inside this WSL distro does not survive the service teardown described
   above, so verification scripts are fed to bash by process substitution from
   `/mnt/c` rather than staged in `/tmp`.
+
+## Milestone 6 note: the same endpoints are ~5-6x slower in a container
+
+The continuously-scraped latencies are much worse than the hand-measured
+Milestone 4 ones, and the gap is not noise:
+
+| Endpoint | M4 (native uvicorn) | M6 (container, 9p bind mount) | Ratio |
+|---|---|---|---|
+| `/health` | 2.48ms p50 | 1.25ms p50 | 0.5x (faster) |
+| `/api/v1/prices/{ticker}` | 24.26ms p50 | 75.9ms p50 | ~3.1x |
+| `/api/v1/lakehouse/stats` | 86.83ms p50 | 492ms p50 | ~5.7x |
+
+`/health` touches no storage and is slightly *faster* in the container, which
+rules out the framework, the middleware and the container runtime as the cause.
+Everything that reads Delta is several times slower. The difference is the
+filesystem: the M4 numbers came from Windows-native uvicorn reading the
+lakehouse off NTFS directly, while the container reads the same files through a
+`/mnt/c` bind mount, which Docker-in-WSL2 reaches over the 9p protocol.
+
+This compounds the full-scan read path recorded under Milestone 4: because
+every request materialises the whole table, latency is dominated by file I/O,
+so a slower filesystem multiplies straight through. `/api/v1/lakehouse/stats`
+reads all three tables and is hit hardest, exactly as that model predicts.
+
+Neither number is "wrong" - they measure different deployments. The honest
+summary is that the API is fast when it reads local disk and noticeably slower
+when the lakehouse arrives over a cross-OS mount, and that the fix for both is
+the same one already recorded: push the predicate into the Parquet scan so the
+reader touches fewer files.
 
 ## Machine baseline (for context on all timings)
 

@@ -1,0 +1,10 @@
+# Auto-provisioned so the stack is useful the moment it starts - no clicking
+# through the UI to add a datasource before any panel renders.
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false

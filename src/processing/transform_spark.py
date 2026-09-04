@@ -95,6 +95,20 @@ def run_transform(
         "table_version": table_version,
     }
     print(f"[transform] {metrics}")
+    try:
+        from src.observability.metrics import push_job_metrics
+
+        push_job_metrics(
+            "rlrp_batch_transform",
+            {
+                "rlrp_transform_rows_in": metrics["rows_in"],
+                "rlrp_transform_rows_out": metrics["rows_out"],
+                "rlrp_transform_duration_seconds": metrics["duration_seconds"],
+                "rlrp_transform_table_version": metrics["table_version"],
+            },
+        )
+    except Exception:  # noqa: BLE001 - metrics must not fail the transform
+        pass
     return metrics
 
 

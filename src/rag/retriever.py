@@ -15,6 +15,21 @@ from src import config
 TOP_K = config.RAG_TOP_K
 
 
+def _observe_retrieval(seconds: float) -> None:
+    """Record retrieval latency, if the metrics stack is importable.
+
+    Wrapped because retrieval must work in a plain CLI run with no observability
+    dependencies present - instrumentation is an addition to this module, not a
+    requirement of it.
+    """
+    try:
+        from src.observability.metrics import RETRIEVAL_SECONDS
+
+        RETRIEVAL_SECONDS.observe(seconds)
+    except Exception:  # noqa: BLE001 - never let metrics break retrieval
+        pass
+
+
 def retrieve(
     query: str,
     k: int = TOP_K,
@@ -42,7 +57,9 @@ def retrieve(
         )
         collection = client.get_collection(name=collection_name)
     except Exception:
-        return {"passages": [], "latency_seconds": round(time.perf_counter() - started, 3)}
+        latency = time.perf_counter() - started
+        _observe_retrieval(latency)
+        return {"passages": [], "latency_seconds": round(latency, 3)}
 
     query_embedding = ollama.embed(model=config.OLLAMA_EMBED_MODEL, input=[query]).embeddings[0]
     result = collection.query(query_embeddings=[query_embedding], n_results=k)
@@ -55,7 +72,9 @@ def retrieve(
     for doc_id, text, meta, dist in zip(ids, documents, metadatas, distances, strict=False):
         passages.append({"id": doc_id, "text": text, "metadata": meta, "distance": dist})
 
-    return {"passages": passages, "latency_seconds": round(time.perf_counter() - started, 3)}
+    latency = time.perf_counter() - started
+    _observe_retrieval(latency)
+    return {"passages": passages, "latency_seconds": round(latency, 3)}
 
 
 if __name__ == "__main__":

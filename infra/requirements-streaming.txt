@@ -22,3 +22,8 @@ pyspark==3.5.3
 # PySpark 3.5.x still does `from distutils.version import LooseVersion`, and
 # distutils left the stdlib in Python 3.12; setuptools restores the shim.
 setuptools>=70
+
+# --- Observability (Milestone 6) ---
+# The Spark driver serves no HTTP and cannot be scraped; it pushes to the
+# Pushgateway after every micro-batch, so it needs the client too.
+prometheus-client>=0.21,<0.24

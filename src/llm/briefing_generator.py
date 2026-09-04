@@ -78,6 +78,17 @@ def _save_briefing(ticker: str, text: str, sources: list[str]) -> str:
     return path
 
 
+def _observe_generation(seconds: float, outcome: str) -> None:
+    """Record briefing latency and outcome; never break generation over metrics."""
+    try:
+        from src.observability.metrics import BRIEFING_SECONDS, BRIEFINGS_TOTAL
+
+        BRIEFING_SECONDS.observe(seconds)
+        BRIEFINGS_TOTAL.labels(outcome).inc()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def generate_briefing(ticker: str, recent: pd.DataFrame, save: bool = True) -> dict:
     """Generate a retrieval-grounded briefing for ``ticker`` over ``recent`` bars.
 
@@ -103,6 +114,8 @@ def generate_briefing(ticker: str, recent: pd.DataFrame, save: bool = True) -> d
     )
     text = response["message"]["content"] if isinstance(response, dict) else response.message.content
     generation_latency = round(time.perf_counter() - gen_started, 2)
+
+    _observe_generation(generation_latency, "success")
 
     saved_to = _save_briefing(ticker, text, sources) if save else None
 

@@ -129,7 +129,36 @@ def _make_batch_writer(delta_table_path: str, metrics: dict, bootstrap_servers: 
             f"write latency avg={statistics.mean(latencies):.2f}s, lag={lag}"
         )
 
+        # Push after EVERY micro-batch, not once at the end. In the
+        # run-until-stopped mode the container uses, "the end" never arrives,
+        # so end-of-run reporting would leave the consumer-lag and throughput
+        # panels permanently empty - exactly the metrics that matter live.
+        _push_batch_metrics(
+            {
+                "rlrp_stream_rows_total": metrics["rows"],
+                "rlrp_stream_batches_total": metrics["batches"],
+                "rlrp_stream_write_latency_avg_seconds": statistics.mean(latencies),
+                "rlrp_stream_last_batch_rows": len(pdf),
+                **({"rlrp_stream_consumer_lag": lag} if lag is not None else {}),
+            }
+        )
+
     return _write_batch
+
+
+def _push_batch_metrics(values: dict) -> None:
+    """Best-effort push of live streaming metrics.
+
+    The Spark driver serves no HTTP, so nothing can scrape it; it pushes.
+    Failures are swallowed - a metrics backend being down must never kill a
+    streaming query.
+    """
+    try:
+        from src.observability.metrics import push_job_metrics
+
+        push_job_metrics("rlrp_stream_consumer", values)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def run_consumer(

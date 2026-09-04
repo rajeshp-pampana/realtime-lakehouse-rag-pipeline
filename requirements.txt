@@ -62,5 +62,8 @@ chroma-hnswlib==0.7.5
 # `sys.modules["onnxruntime"]` before chromadb is ever imported - so the
 # real onnxruntime package isn't needed here at all, on any platform.
 
-# --- Added in later milestones ---
-# Milestone 6: prometheus-client, structlog
+# --- Observability (Milestone 6) ---
+# prometheus_client provides both the /metrics exposition for the long-lived
+# API and the Pushgateway client used by short-lived jobs (the Airflow batch
+# tasks) and the non-HTTP streaming consumer, which nothing can scrape.
+prometheus-client>=0.21,<0.24

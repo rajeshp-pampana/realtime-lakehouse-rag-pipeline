@@ -83,6 +83,21 @@ def fetch_and_save_data(tickers: list[str] | None = None) -> str:
     return RAW_DIR
 
 
+def _push(job: str, values: dict) -> None:
+    """Push batch metrics, best-effort.
+
+    An Airflow task that runs for a minute and exits is never caught by a
+    15-second scrape, so batch jobs push instead. Import is local and failures
+    are swallowed: ingestion must not depend on a metrics stack being up.
+    """
+    try:
+        from src.observability.metrics import push_job_metrics
+
+        push_job_metrics(job, values)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def ingest_to_delta(
     tickers: list[str] | None = None, table_path: str | None = None
 ) -> dict:
@@ -132,6 +147,16 @@ def ingest_to_delta(
         "table_version": table_version,
     }
     print(f"[ingest] {metrics}")
+    _push(
+        "rlrp_batch_ingest",
+        {
+            "rlrp_ingest_rows": metrics["rows_ingested"],
+            "rlrp_ingest_duration_seconds": metrics["duration_seconds"],
+            "rlrp_ingest_tickers_ok": metrics["tickers_ok"],
+            "rlrp_ingest_tickers_failed": len(metrics["tickers_failed"]),
+            "rlrp_ingest_table_version": metrics["table_version"],
+        },
+    )
     return metrics
 
 

@@ -44,7 +44,14 @@ def _load_last_closes() -> dict[str, float]:
 
         pdf = DeltaTable(config.DELTA_OHLCV_RAW).to_pandas()
         return pdf.sort_values("Date").groupby("Ticker")["Close"].last().to_dict()
-    except Exception:
+    except BaseException as exc:
+        # See src/api/lakehouse.py: delta-rs raises pyo3_runtime.PanicException
+        # (a BaseException) when the table location cannot be read or created,
+        # so `except Exception` lets it through. This fallback exists precisely
+        # so a missing batch table never stops the producer.
+        if isinstance(exc, KeyboardInterrupt | SystemExit):
+            raise
+        print(f"[tick_producer] no seed prices from {config.DELTA_OHLCV_RAW} ({exc.__class__.__name__}); using flat seed")
         return {}
 
 

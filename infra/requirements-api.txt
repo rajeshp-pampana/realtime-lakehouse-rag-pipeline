@@ -29,3 +29,7 @@ pydantic-settings>=2.5,<3.0
 ollama>=0.4,<0.6
 chromadb>=0.5,<0.6
 chroma-hnswlib==0.7.5
+
+# --- Observability (Milestone 6) ---
+# The API is scraped at /metrics, so the exposition client ships in the image.
+prometheus-client>=0.21,<0.24

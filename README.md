@@ -69,6 +69,7 @@ realtime-lakehouse-rag-pipeline/
 │   │   ├── retriever.py                 # retrieval step before every LLM call
 │   │   └── _chromadb_compat.py          # Windows onnxruntime/chromadb import-time fix
 │   ├── llm/briefing_generator.py        # Llama 3 via Ollama, retrieval-grounded, saves each briefing
+│   ├── observability/metrics.py         # Prometheus metrics + best-effort Pushgateway client
 │   └── api/
 │       ├── main.py                      # FastAPI service, OpenAPI docs enabled
 │       ├── schemas.py                   # Pydantic response models = the published contract
@@ -76,7 +77,10 @@ realtime-lakehouse-rag-pipeline/
 ├── ui/
 │   ├── streamlit_app.py             # internal analyst console — thin client, HTTP only
 │   └── api_client.py                # the console's HTTP client for the API
-├── monitoring/                      # prometheus.yml + grafana dashboard
+├── monitoring/
+│   ├── prometheus.yml               # scrape config: api + pushgateway (honor_labels)
+│   └── grafana/                     # auto-provisioned datasource + Pipeline Health dashboard
+├── scripts/                         # CI step logic, runnable locally
 ├── tests/                           # pytest: processing, streaming, rag, api, infra
 ├── infra/
 │   ├── docker-compose.yml           # kafka + api + ui by default; streaming/orchestration behind profiles
@@ -87,7 +91,7 @@ realtime-lakehouse-rag-pipeline/
 │       ├── deployment.yaml      # Namespace, ConfigMap, API + UI Deployments
 │       ├── service.yaml         # ClusterIP (in-cluster) + NodePort (host access)
 │       └── helm/rlrp/           # the same resources as a parameterised chart
-├── .github/workflows/ci.yml         # lint + test (+ image build, e2e in M6)
+├── .github/workflows/ci.yml         # lint/test, image builds, compose e2e, kind smoke test
 ├── data/raw/                        # baseline CSVs from the ported ingestion path (no longer read by the UI)
 ├── data/delta/                      # Delta Lake tables: ohlcv_raw/ticks_raw (bronze), ohlcv_curated (silver) — gitignored
 ├── data/briefings/                  # every briefing ever generated (frontmatter + text) — gitignored, grows locally
@@ -104,7 +108,7 @@ realtime-lakehouse-rag-pipeline/
 - [x] **M3 — RAG layer.** Local vector store; index past briefings/context; retrieval step before every LLM call.
 - [x] **M4 — Service split.** FastAPI service with OpenAPI docs; Streamlit becomes a thin client.
 - [x] **M5 — Containerization + deployment.** Dockerize API/UI/streaming; Kafka in docker-compose; k8s manifests / Helm deployed to a local `kind` cluster.
-- [ ] **M6 — CI/CD + tests + observability.** pytest for batch/stream/retrieval; GitHub Actions lint/test/build; Prometheus + Grafana pipeline-health dashboard.
+- [x] **M6 — CI/CD + tests + observability.** pytest for batch/stream/retrieval; GitHub Actions lint/test/build/e2e/k8s; Prometheus + Grafana pipeline-health dashboard.
 - [ ] **M7 — Documentation + metrics capture.** README rewrite with architecture diagram and real measured numbers; every CV `[INSERT]` backed by a measurement.
 
 ## Running locally
@@ -454,6 +458,60 @@ Docker/Compose and Kubernetes are both complete and verified against a real
 healthy rather than merely deploying fast. Nothing here is marked done on the
 strength of looking plausible — see [docs/METRICS.md](docs/METRICS.md) for what
 was measured.
+
+### Milestone 6 — CI/CD + observability
+
+**Metrics.** Three components need observing and none can be observed the same
+way, which is why there are two collection paths rather than one:
+
+| Component | How | Why |
+|---|---|---|
+| FastAPI service | scraped at `/metrics` | Long-lived and already serving HTTP |
+| Batch tasks (ingest, transform) | push to Pushgateway | An Airflow task that runs 60s and exits is never caught by a 15s scrape |
+| Streaming consumer | pushes after **every micro-batch** | A Spark driver serves no HTTP at all — and in run-until-stopped mode "the end of the run" never arrives, so end-of-run reporting would leave the lag panel empty forever |
+
+Every push is best-effort and swallows its own failures. A metrics backend
+being down must not fail an ingestion run or kill a streaming query —
+observability that can take out the pipeline is worse than none.
+
+```bash
+docker compose --profile monitoring up      # prometheus + grafana + pushgateway
+```
+
+- Grafana  <http://localhost:3000>  (anonymous admin, local dev only)
+- Prometheus <http://localhost:9090>
+- API metrics <http://localhost:8000/metrics>
+
+The datasource and the 14-panel **Pipeline Health** dashboard are
+auto-provisioned, so the stack is useful the moment it starts.
+
+Two details that matter more than they look:
+
+- **The `endpoint` label is the route template**, not the raw path. Labelling
+  per-ticker would add a time series for every symbol — unbounded cardinality,
+  the standard way to overwhelm a Prometheus server. A test asserts this.
+- **`honor_labels: true` on the Pushgateway scrape.** Without it Prometheus
+  overwrites each pushed series' own `job` label with the scrape job's name,
+  collapsing batch and streaming metrics into one indistinguishable series.
+
+**CI.** Four jobs, with the expensive three gated behind the cheap one and
+`cancel-in-progress` so superseded pushes don't burn minutes:
+
+| Job | What it proves |
+|---|---|
+| `lint-and-test` | ruff + the full pytest suite |
+| `build-images` | all three images build; each contains what it should and **nothing it shouldn't** |
+| `compose-e2e` | Kafka → producer → Spark consumer → Delta, with rows that did not exist before, plus `/metrics` exposition |
+| `k8s-smoke` | Helm lint/render, deploy to a real kind cluster, UI→API over cluster DNS, and the upgrade path |
+
+Shell logic lives in `scripts/` rather than inline YAML, so each step is
+readable and runnable locally. The streaming check reads its baseline from the
+live API and **aborts if it cannot** — an earlier local version defaulted to
+zero on failure, which would have reported pre-existing rows as newly landed.
+
+**Verified**: see [docs/METRICS.md](docs/METRICS.md) — 3/3 Prometheus targets
+up, 218 real requests recorded, batch metrics surviving the push path with
+their labels intact, and Grafana querying through its own datasource.
 
 ## Known limitations
 
