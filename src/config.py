@@ -41,3 +41,12 @@ BRIEFINGS_DIR = os.environ.get("BRIEFINGS_DIR", "data/briefings")
 # --- API (Milestone 4) ---
 API_HOST = os.environ.get("API_HOST", "0.0.0.0")
 API_PORT = int(os.environ.get("API_PORT", "8000"))
+# What the Streamlit thin client dials. Separate from API_HOST/API_PORT (which
+# are the *bind* address) so the UI can point at a container, a k8s service, or
+# a remote host in Milestone 5 without the API's own binding changing.
+API_BASE_URL = os.environ.get("API_BASE_URL", "http://localhost:8000")
+# Briefing generation runs a local LLM and can take minutes on modest hardware
+# (see docs/METRICS.md) - the UI's HTTP client needs a timeout that reflects
+# that, not the usual few seconds.
+API_TIMEOUT_SECONDS = float(os.environ.get("API_TIMEOUT_SECONDS", "30"))
+API_BRIEFING_TIMEOUT_SECONDS = float(os.environ.get("API_BRIEFING_TIMEOUT_SECONDS", "900"))

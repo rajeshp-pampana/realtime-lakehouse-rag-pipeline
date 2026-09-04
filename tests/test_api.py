@@ -1,0 +1,253 @@
+"""Tests for the Milestone 4 FastAPI service.
+
+These build real Delta tables in a tmp directory and point the API's config at
+them, so the endpoints are exercised against genuine Delta reads (delta-rs, no
+Spark and no network) rather than mocks. That keeps them fully portable - they
+run identically on Windows and in CI.
+
+The briefing endpoint's happy path needs a local Ollama, so only its error
+handling is asserted here; the generation path itself is covered by
+``tests/test_rag.py`` and by the real measured runs in docs/METRICS.md.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pandas as pd
+import pytest
+from fastapi.testclient import TestClient
+
+from src import config
+from src.api.main import app
+
+client = TestClient(app)
+
+
+@pytest.fixture
+def lakehouse_tables(tmp_path, monkeypatch):
+    """Write small but real curated/ticks Delta tables and point config at them."""
+    from deltalake import write_deltalake
+
+    curated_path = tmp_path / "ohlcv_curated"
+    ticks_path = tmp_path / "ticks_raw"
+
+    curated = pd.DataFrame(
+        {
+            "Date": ["2026-09-01", "2026-09-02", "2026-09-03"] * 2,
+            "Ticker": ["MSFT"] * 3 + ["NVDA"] * 3,
+            "Open": [500.0, 501.0, 502.0, 100.0, 101.0, 102.0],
+            "High": [510.0, 511.0, 512.0, 110.0, 111.0, 112.0],
+            "Low": [495.0, 496.0, 497.0, 95.0, 96.0, 97.0],
+            "Close": [505.0, 506.0, 507.0, 105.0, 106.0, 107.0],
+            "Volume": [1000, 1100, 1200, 2000, 2100, 2200],
+            "ingested_at_utc": ["2026-09-03T00:00:00+00:00"] * 6,
+            "SMA_20": [505.0, 505.5, 506.0, 105.0, 105.5, 106.0],
+            "SMA_50": [505.0, 505.5, 506.0, 105.0, 105.5, 106.0],
+            # First bar per ticker has no previous close - NaN must serialise as null.
+            "daily_return": [float("nan"), 0.00198, 0.00198, float("nan"), 0.00952, 0.00943],
+            "volatility_20d": [float("nan"), 0.001, 0.001, float("nan"), 0.002, 0.002],
+        }
+    )
+    ticks = pd.DataFrame(
+        {
+            "ticker": ["MSFT", "MSFT", "NVDA"],
+            "price": [505.1, 505.2, 105.1],
+            "size": [100, 200, 300],
+            "event_time": [
+                "2026-09-03T18:52:08.189445+00:00",
+                "2026-09-03T18:52:09.189445+00:00",
+                "2026-09-03T18:52:10.189445+00:00",
+            ],
+            "kafka_timestamp": ["2026-09-04 00:22:08.189"] * 3,
+        }
+    )
+
+    write_deltalake(str(curated_path), curated, mode="overwrite")
+    write_deltalake(str(ticks_path), ticks, mode="overwrite")
+
+    monkeypatch.setattr(config, "DELTA_OHLCV_CURATED", str(curated_path))
+    monkeypatch.setattr(config, "DELTA_TICKS_RAW", str(ticks_path))
+    monkeypatch.setattr(config, "DELTA_OHLCV_RAW", str(tmp_path / "missing_raw"))
+    return {"curated": curated_path, "ticks": ticks_path}
+
+
+def test_health_needs_no_lakehouse():
+    response = client.get("/health")
+    assert response.status_code == 200
+    assert response.json()["status"] == "ok"
+
+
+def test_tickers_endpoint_lists_portfolio():
+    response = client.get("/api/v1/tickers")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["count"] == len(body["tickers"])
+    assert "MSFT" in body["tickers"]
+
+
+def test_openapi_documents_every_endpoint():
+    """The milestone's whole point is a documented contract - assert it exists."""
+    spec = client.get("/openapi.json").json()
+    for path in (
+        "/health",
+        "/api/v1/tickers",
+        "/api/v1/prices/{ticker}",
+        "/api/v1/ticks/{ticker}",
+        "/api/v1/briefings/{ticker}",
+        "/api/v1/lakehouse/stats",
+    ):
+        assert path in spec["paths"], f"{path} missing from OpenAPI spec"
+    assert "Bar" in spec["components"]["schemas"]
+
+
+def test_prices_returns_curated_bars_with_indicators(lakehouse_tables):
+    response = client.get("/api/v1/prices/MSFT")
+    assert response.status_code == 200
+    body = response.json()
+
+    assert body["ticker"] == "MSFT"
+    assert body["rows"] == 3
+    assert body["table_version"] == 0
+    bars = body["bars"]
+    assert [b["Date"] for b in bars] == ["2026-09-01", "2026-09-02", "2026-09-03"]
+    assert bars[0]["SMA_20"] == 505.0
+    # NaN -> null, not a crash and not a NaN literal (which isn't valid JSON).
+    assert bars[0]["daily_return"] is None
+    assert bars[1]["daily_return"] == pytest.approx(0.00198)
+
+
+def test_prices_is_case_insensitive_and_limit_applies(lakehouse_tables):
+    response = client.get("/api/v1/prices/msft", params={"limit": 2})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["rows"] == 2
+    # limit keeps the most recent bars, not the first ones.
+    assert [b["Date"] for b in body["bars"]] == ["2026-09-02", "2026-09-03"]
+
+
+def test_prices_unknown_ticker_is_404(lakehouse_tables):
+    assert client.get("/api/v1/prices/NOPE").status_code == 404
+
+
+def test_prices_rejects_invalid_limit(lakehouse_tables):
+    assert client.get("/api/v1/prices/MSFT", params={"limit": 0}).status_code == 422
+    assert client.get("/api/v1/prices/MSFT", params={"limit": 99999}).status_code == 422
+
+
+def test_ticks_endpoint_returns_streaming_rows(lakehouse_tables):
+    response = client.get("/api/v1/ticks/MSFT")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["rows"] == 2
+    assert body["ticks"][0]["ticker"] == "MSFT"
+    assert body["ticks"][0]["price"] == pytest.approx(505.1)
+
+
+def test_missing_table_is_503_not_500(tmp_path, monkeypatch):
+    """A pipeline that hasn't run yet is a dependency problem, not a server bug."""
+    monkeypatch.setattr(config, "DELTA_OHLCV_CURATED", str(tmp_path / "never_created"))
+    response = client.get("/api/v1/prices/MSFT")
+    assert response.status_code == 503
+    assert "not available yet" in response.json()["detail"]
+
+
+def test_lakehouse_stats_reports_available_and_missing(lakehouse_tables):
+    response = client.get("/api/v1/lakehouse/stats")
+    assert response.status_code == 200
+    tables = {t["name"]: t for t in response.json()["tables"]}
+
+    assert tables["ohlcv_curated"]["available"] is True
+    assert tables["ohlcv_curated"]["rows"] == 6
+    assert tables["ticks_raw"]["available"] is True
+    # A missing table degrades this one entry rather than failing the request.
+    assert tables["ohlcv_raw"]["available"] is False
+    assert tables["ohlcv_raw"]["detail"]
+
+
+def test_briefing_unknown_ticker_is_404(lakehouse_tables):
+    """Fails before ever reaching the LLM, so this is portable/offline-safe."""
+    assert client.post("/api/v1/briefings/NOPE").status_code == 404
+
+
+def test_briefing_surfaces_generation_failure_as_502(lakehouse_tables, monkeypatch):
+    """A dead local model is an upstream failure, not an opaque 500."""
+    import src.llm.briefing_generator as bg
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("ollama is not reachable")
+
+    monkeypatch.setattr(bg, "generate_briefing", boom)
+    response = client.post("/api/v1/briefings/MSFT")
+    assert response.status_code == 502
+    assert "ollama is not reachable" in response.json()["detail"]
+
+
+# --- The "thin client" claim itself -------------------------------------------------
+#
+# The milestone's substance is that the UI stopped reading the filesystem and
+# stopped running inference in-process. That's a structural property, so it gets
+# a structural test that runs everywhere rather than relying on manual review.
+
+UI_APP = Path(__file__).resolve().parent.parent / "ui" / "streamlit_app.py"
+
+
+def _ui_tree():
+    """Parse the UI as an AST.
+
+    Deliberately AST-based rather than a substring scan of the source: the
+    module docstring *describes* what the UI no longer does ("before M4 it read
+    data/raw/*.csv"), and a naive text search flags that prose as a violation.
+    Only real code should be able to fail these.
+    """
+    import ast
+
+    return ast.parse(UI_APP.read_text(encoding="utf-8"))
+
+
+def test_ui_imports_no_data_or_inference_modules():
+    import ast
+
+    banned_prefixes = ("src.llm", "src.rag", "deltalake", "ollama")
+    imported: list[str] = []
+    for node in ast.walk(_ui_tree()):
+        if isinstance(node, ast.Import):
+            imported.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.append(node.module)
+
+    offenders = [
+        name for name in imported if any(name.startswith(p) for p in banned_prefixes)
+    ]
+    assert not offenders, (
+        f"UI must reach data and inference through the API, not import them: {offenders}"
+    )
+
+
+def test_ui_makes_no_direct_data_reads():
+    import ast
+
+    banned_calls = {"read_csv", "read_parquet", "DeltaTable"}
+    called: list[str] = []
+    for node in ast.walk(_ui_tree()):
+        if isinstance(node, ast.Call):
+            func = node.func
+            name = getattr(func, "attr", None) or getattr(func, "id", None)
+            if name in banned_calls:
+                called.append(name)
+
+    assert not called, f"UI must not read data files directly: {called}"
+
+
+def test_ui_talks_to_the_api():
+    import ast
+
+    tree = _ui_tree()
+    api_imports = {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module == "ui.api_client"
+        for alias in node.names
+    }
+    for call in ("get_tickers", "get_prices", "create_briefing"):
+        assert call in api_imports, f"UI should use api_client.{call}"

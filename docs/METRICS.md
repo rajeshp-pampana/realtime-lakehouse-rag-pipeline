@@ -23,7 +23,12 @@ placeholder in the CV Projects section.
 | Briefing generation latency, cold (includes `llama3` model load) | 480.28s | 2026-09-04 | Run 1 of the same benchmark. 5.2-7.3x the warm figure: the 4.7GB model has to be paged in against ~1.4GB available RAM (see below) | M3 |
 | Briefing generation latency, under heavy contention | 537.93s (~9 min) | 2026-09-03 | Same call, but measured while the machine was down to ~177MB free RAM (~4 VS Code processes + multiple Claude Code processes). Kept here deliberately as the worst-case datapoint - the small gap to the 480.28s cold run is what identified this workload as memory-bound rather than CPU-bound | M3 |
 | Local `llama3` token throughput (warm) | **2.73 tok/s** generation (44 tok in 16.09s), 3.26 tok/s prompt eval (20 tok in 6.14s), 0.26s model load | 2026-09-04 | Raw `ollama.chat()` response's own `eval_count`/`eval_duration`/`prompt_eval_*`/`load_duration` fields. For contrast, the same kind of call under the contention above managed 3 tokens in 44s (~0.07 tok/s) - a ~40x difference | M3 |
-| API p50 / p95 latency per endpoint | _tbd_ | | | M4 / M6 |
+| **API latency, `GET /health`** | **p50 2.48ms, p95 3.11ms** (min 2.16, max 3.67) | 2026-09-04 | 50 real HTTP requests against a running `uvicorn` (not TestClient), after 5 warmup calls. No lakehouse dependency, so this is the framework floor | M4 |
+| **API latency, `GET /api/v1/tickers`** | **p50 2.25ms, p95 2.58ms** | 2026-09-04 | Same harness. In-memory constant - matches the `/health` floor as expected | M4 |
+| **API latency, `GET /api/v1/prices/{ticker}`** | **p50 24.26ms, p95 26.98ms** (`limit=100`); **p50 23.25ms, p95 25.60ms** (`limit=5`) | 2026-09-04 | Same harness, against the real 406-row `ohlcv_curated` table. Note `limit` barely moves the number - see "full-scan read path" below | M4 |
+| **API latency, `GET /api/v1/ticks/{ticker}`** | **p50 55.93ms, p95 66.99ms** | 2026-09-04 | Same harness, against the real 765-row `ticks_raw` table. ~2.3x the `prices` endpoint: same code path, but this table is at Delta version 16 (17 commits from the streaming micro-batches) vs version 0, so there is more transaction log to replay | M4 |
+| **API latency, `GET /api/v1/lakehouse/stats`** | **p50 86.83ms, p95 164.04ms** (min 57.36, max 278.24) | 2026-09-04 | Same harness. Reads all three tables in full, so it costs roughly the sum of the others - the widest p50/p95 spread of any endpoint | M4 |
+| **API latency, `POST /api/v1/briefings/{ticker}`** | **521.48s end-to-end over HTTP** (retrieval 1.512s + generation 516.13s) | 2026-09-04 | Single real request to the running server; the full path (Delta read -> Chroma retrieval -> Ollama generation -> briefing saved to `data/briefings/`) returned 200. Cold model load again - `llama3` had been evicted by the time this ran, so it matches the 480.28s cold figure above, not the 65-93s warm one. No p50/p95: a single sample, and quoting percentiles off one call would be fake precision. Sources retrieved: 2 prior briefings + `tickers.md` + `schema_notes.md` | M4 |
 | CI pipeline duration (lint + test + build) | _tbd_ | | | M6 |
 
 ## Milestone 3 "Done when" proof: a briefing citing retrieved context
@@ -64,6 +69,24 @@ way the run above did - the retrieval step is deterministic and always
 happens, but whether the model verbalises the attribution varies between
 generations. The quoted run above remains the "Done when" evidence because it
 shows the citation explicitly.
+
+## Milestone 4 note: the full-scan read path
+
+The measured `prices` numbers say something the pass/fail wouldn't: `limit=5`
+(23.25ms p50) and `limit=100` (24.26ms p50) cost essentially the same. That's
+because `src/api/lakehouse.py` calls `DeltaTable(...).to_pandas()` and *then*
+filters by ticker and tail-slices in pandas - so every request materialises the
+whole table regardless of how few rows it returns. Latency here tracks table
+size and Delta history depth, not response size, which is also why `ticks_raw`
+(765 rows, version 16) is ~2.3x `ohlcv_curated` (406 rows, version 0) through
+identical code.
+
+At current volumes this is comfortably fast enough and the simplicity is worth
+it. It would not survive real data volumes, and the fix is understood rather
+than hypothetical: push the predicate down into the Parquet scan
+(`DeltaTable.to_pyarrow_dataset()` with a filter, or partition the tables by
+`Ticker`) so the reader touches only the relevant files. Recorded here as a
+known, measured limitation rather than presented as a finished result.
 
 ## Machine baseline (for context on all timings)
 
