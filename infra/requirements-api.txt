@@ -1,0 +1,31 @@
+# Runtime dependencies for the FastAPI service image (infra/Dockerfile.api).
+#
+# Deliberately a subset of the top-level requirements.txt, which is the dev/CI
+# set (everything, so one venv can run every component and the whole test
+# suite). Baking that into each image would put pyspark, streamlit and plotly
+# into a service that imports none of them.
+#
+# Version constraints must stay in sync with requirements.txt - that file
+# remains the single source of truth for what versions this project runs on;
+# these files only decide *which* of those packages each image needs.
+
+# --- Config ---
+python-dotenv>=1.0,<2.0
+
+# --- Delta read layer (delta-rs, no JVM - the API deliberately avoids Spark) ---
+pandas>=2.2,<2.3
+pyarrow>=17,<19
+deltalake>=0.21,<0.25
+
+# --- Service ---
+fastapi>=0.115,<0.130
+uvicorn[standard]>=0.30,<0.40
+pydantic>=2.9,<3.0
+pydantic-settings>=2.5,<3.0
+
+# --- RAG + LLM, for POST /api/v1/briefings ---
+# Imported lazily inside the endpoint rather than at startup, but still needed
+# in the image for that endpoint to work.
+ollama>=0.4,<0.6
+chromadb>=0.5,<0.6
+chroma-hnswlib==0.7.5

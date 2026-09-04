@@ -31,7 +31,7 @@ from src.api.schemas import (
     TickerListResponse,
     TicksResponse,
 )
-from src.ingestion.fetch_market_data import TICKERS
+from src.config import TICKERS
 
 API_VERSION = "1.0.0"
 V1 = "/api/v1"

@@ -24,6 +24,16 @@ STREAM_CHECKPOINT_DIR = os.environ.get("STREAM_CHECKPOINT_DIR", "data/checkpoint
 
 INGEST_PERIOD = os.environ.get("INGEST_PERIOD", "1mo")
 
+# The portfolio the pipeline covers. Lives here rather than in
+# ingestion/fetch_market_data.py because it is configuration, not ingestion
+# logic - and because the API needs the list but must not pull yfinance (and
+# its transitive deps) into its image just to read a constant. Milestone 5
+# made that coupling expensive enough to be worth removing.
+TICKERS = [
+    "MSFT", "CRWD", "AVGO", "GLE.PA", "NVDA", "AMZN", "AXON", "PANW",
+    "INTC", "NOW", "IREN", "GOOG", "MU", "SOFI", "PLTR", "RDW", "DRAM",
+]
+
 # --- Kafka (Milestone 2) ---
 KAFKA_BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 KAFKA_TICKS_TOPIC = os.environ.get("KAFKA_TICKS_TOPIC", "market.ticks")

@@ -77,8 +77,16 @@ realtime-lakehouse-rag-pipeline/
 │   ├── streamlit_app.py             # internal analyst console — thin client, HTTP only
 │   └── api_client.py                # the console's HTTP client for the API
 ├── monitoring/                      # prometheus.yml + grafana dashboard
-├── tests/                           # pytest: processing, streaming, rag, api
-├── infra/                           # docker-compose, Dockerfiles, k8s manifests/Helm
+├── tests/                           # pytest: processing, streaming, rag, api, infra
+├── infra/
+│   ├── docker-compose.yml           # kafka + api + ui by default; streaming/orchestration behind profiles
+│   ├── Dockerfile.{api,ui,streaming,airflow}
+│   ├── requirements-{api,ui,streaming}.txt   # per-image deps; versions pinned by requirements.txt
+│   └── k8s/
+│       ├── kind-cluster.yaml     # local cluster: pinned node image, NodePort->host, lakehouse mount
+│       ├── deployment.yaml      # Namespace, ConfigMap, API + UI Deployments
+│       ├── service.yaml         # ClusterIP (in-cluster) + NodePort (host access)
+│       └── helm/rlrp/           # the same resources as a parameterised chart
 ├── .github/workflows/ci.yml         # lint + test (+ image build, e2e in M6)
 ├── data/raw/                        # baseline CSVs from the ported ingestion path (no longer read by the UI)
 ├── data/delta/                      # Delta Lake tables: ohlcv_raw/ticks_raw (bronze), ohlcv_curated (silver) — gitignored
@@ -95,7 +103,7 @@ realtime-lakehouse-rag-pipeline/
 - [x] **M2 — Streaming ingestion.** Kafka (KRaft); simulated tick producer; Spark Structured Streaming consumer writing the same Delta tables.
 - [x] **M3 — RAG layer.** Local vector store; index past briefings/context; retrieval step before every LLM call.
 - [x] **M4 — Service split.** FastAPI service with OpenAPI docs; Streamlit becomes a thin client.
-- [ ] **M5 — Containerization + deployment.** Dockerize API/UI/streaming; Kafka in docker-compose; k8s manifests / Helm on a local `kind` cluster.
+- [x] **M5 — Containerization + deployment.** Dockerize API/UI/streaming; Kafka in docker-compose; k8s manifests / Helm deployed to a local `kind` cluster.
 - [ ] **M6 — CI/CD + tests + observability.** pytest for batch/stream/retrieval; GitHub Actions lint/test/build; Prometheus + Grafana pipeline-health dashboard.
 - [ ] **M7 — Documentation + metrics capture.** README rewrite with architecture diagram and real measured numbers; every CV `[INSERT]` backed by a measurement.
 
@@ -308,6 +316,144 @@ data files.
 **Verified**: real p50/p95 per endpoint in [docs/METRICS.md](docs/METRICS.md),
 measured over HTTP against a running server — plus a measured note on the
 full-scan read path the numbers exposed.
+
+### Milestone 5 — Containerization
+
+Every component now has an image, and the streaming producer/consumer move
+from plain WSL2 processes into containers. The Kubernetes/Helm half of this
+milestone is deliberately not started yet — see "Status" below.
+
+```bash
+cd infra
+docker compose up                                       # kafka + api + ui
+docker compose --profile streaming up                   # + producer/consumer
+docker compose --profile orchestration up               # + airflow
+```
+
+Services without a `profiles` key start by default; Spark and Airflow are the
+memory-hungry ones and stay opt-in, because this is an 8 GB machine and
+bringing everything up at once is not the common case.
+
+**Dependencies are split per service** (`infra/requirements-*.txt`) rather than
+every image installing the top-level `requirements.txt`. That file remains the
+source of truth for *versions* — CI and the dev venv install it, so it is what
+the test suite actually runs against — while the per-service files only choose
+*which* of those packages an image needs. `tests/test_infra.py` enforces the
+relationship: every per-service package must exist in `requirements.txt` with
+an identical specifier, so the split can't silently drift into shipping a
+version CI never tested.
+
+The split is also a check on the architecture, not just a size optimisation:
+
+- The **UI image has no `deltalake`, `pyspark`, `chromadb` or `ollama`**. Since
+  M4 the console is a thin HTTP client, so if it ever regressed to reading data
+  or running inference directly, its container would fail outright.
+- The **API image has no `pyspark`, `streamlit` or `yfinance`**. It reads Delta
+  through delta-rs and needs no JVM.
+
+Two couplings this milestone exposed and fixed:
+
+- `src/api/main.py` imported `TICKERS` from `ingestion/fetch_market_data.py`,
+  pulling `yfinance` into the API image for a list of 17 strings. `TICKERS`
+  moved to `src/config.py`, where it belongs — it is configuration, not
+  ingestion logic.
+- `tick_producer` and `stream_consumer` default to **bounded** runs (30s/60s),
+  because Milestone 2 only ever needed verification runs. Under
+  `restart: unless-stopped` a bounded run is a restart loop, not a service, so
+  both now accept `0` to mean run-until-stopped and compose passes it
+  explicitly.
+
+Two container-only constraints worth knowing about, both found by running the
+stack rather than by reading the config:
+
+- **Spark checkpoints live on a named volume, not under `../data`.** Spark
+  chmods its checkpoint directory, which fails on a Windows-backed bind mount
+  as a non-root user. The named volume is also seeded with the image's
+  ownership of `/checkpoints`, which is why the Dockerfile creates and
+  `chown`s it — a volume that arrives root-owned stops Spark dead.
+- **The streaming image bakes the Kafka connector JARs.** `spark.jars.packages`
+  otherwise resolves them from Maven Central when the *query* starts, making
+  every cold container start depend on public internet access.
+
+Ollama is deliberately **not** containerized: it is a 4.7 GB model server that
+would dwarf this stack and is already installed natively. The API reaches it
+via the host gateway, which also requires `OLLAMA_HOST=0.0.0.0` on the host so
+it listens beyond loopback. Without that, every read endpoint works and only
+`POST /briefings` returns 502.
+
+**Verified** (see [docs/METRICS.md](docs/METRICS.md)): the default stack reaches
+all-healthy in 27s; the UI container fetches curated bars from the API over the
+compose network; and with the streaming profile up, **918 new tick rows landed
+in Delta in 76s** through the containerized producer → Kafka → Spark consumer
+path, read back through the API. Peak footprint is ~1.27 GB across five
+containers.
+
+#### Kubernetes (kind + Helm)
+
+The API and console also deploy to a real local Kubernetes cluster. Two paths
+are maintained — plain manifests for readability, a Helm chart for packaging —
+and a test asserts they agree on images and ports so they cannot drift.
+
+```bash
+# tooling (installs to ~/.local/bin, no sudo needed)
+# kubectl v1.37.0 / kind v0.33.0 / helm v4.2.4
+
+kind create cluster --config infra/k8s/kind-cluster.yaml
+kind load docker-image rlrp-api:local rlrp-ui:local --name rlrp   # no registry
+
+# either path:
+kubectl apply -f infra/k8s/deployment.yaml -f infra/k8s/service.yaml
+helm install rlrp infra/k8s/helm/rlrp -n rlrp --create-namespace --wait
+```
+
+Then `http://localhost:8000/docs` and `http://localhost:8501`.
+
+Decisions worth calling out:
+
+- **The node image is pinned by digest.** kind's default node image changes
+  with every kind release, so an unpinned cluster silently changes Kubernetes
+  version when the tool is upgraded — the same drift class that broke the
+  streaming build when `python:3.12-slim` moved to Debian 13.
+- **`imagePullPolicy: IfNotPresent` everywhere.** These images exist only
+  locally (loaded with `kind load`); any policy that reaches out lands in
+  `ImagePullBackOff` against a registry that has never heard of `rlrp-api`.
+- **NodePort, not Ingress.** A single-node local cluster would need an ingress
+  controller installed, running and debugged to gain nothing here. The
+  NodePorts are paired with `extraPortMappings` so they surface on the host at
+  the same ports compose used.
+- **The chart takes its namespace from `.Release.Namespace`**, not a values
+  key — templating it separately lets the chart disagree with the `-n` flag it
+  is installed with.
+- **The UI Deployment mounts no volumes.** It is a thin HTTP client and its
+  image ships no `deltalake`/`pyspark`, so the k8s layer reflects the same
+  boundary the image enforces.
+
+One caveat about `kubectl apply --dry-run=server` on these manifests: it
+reports `namespaces "rlrp" not found`, because a server dry-run does not
+actually create the Namespace that the same file defines. That is a property
+of dry-run, not a defect in the manifests — the real apply succeeds.
+
+**Keeping the cluster alive on WSL2.** This distro tears its services down
+when no process holds it open, which stops Docker and takes the kind node with
+it — the node used to die within 1–3 minutes. Hold the distro open before
+creating the cluster:
+
+```bash
+wsl -d Ubuntu -- bash -lc 'sleep 86400' &   # or any long-lived process
+```
+
+The failure this produces is misleading: the *next* Docker operation fails with
+a cgroup/systemd scope error, which reads like a Docker cgroup-driver problem
+rather than "the distro was shut down underneath you". See
+[docs/METRICS.md](docs/METRICS.md) for the evidence that distinguished them.
+
+#### Status
+
+Docker/Compose and Kubernetes are both complete and verified against a real
+`kind` cluster, including a 20-minute soak test showing the cluster stays
+healthy rather than merely deploying fast. Nothing here is marked done on the
+strength of looking plausible — see [docs/METRICS.md](docs/METRICS.md) for what
+was measured.
 
 ## Known limitations
 

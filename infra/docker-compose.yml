@@ -6,28 +6,55 @@
 #                                reference compose (webserver/scheduler/
 #                                triggerer/worker/Postgres/Redis) — this
 #                                machine has 8 GB RAM and one linear DAG
-#                                doesn't need that topology. Swapped for a
-#                                heavier setup later only if a milestone
-#                                actually needs it (e.g. real parallelism).
-#                                Verified via WSL2 + `airflow dags test`
-#                                instead of this compose file for M1 itself
-#                                (faster to a verified run on this machine);
-#                                this service is kept for Milestone 5.
-# Milestone 2 (this): kafka    -- single-broker KRaft mode (no ZooKeeper).
-#                                tick_producer.py / stream_consumer.py run as
-#                                plain WSL2 processes against this broker for
-#                                now (containerized in Milestone 5).
-# Milestone 4 adds:  api (FastAPI)
-# Milestone 5 adds:  ui (Streamlit), tick-producer/stream-consumer containers,
-#                     full Dockerfile wiring
+#                                doesn't need that topology. Verified via
+#                                WSL2 + `airflow dags test` rather than this
+#                                compose file for M1 itself.
+# Milestone 2:       kafka    -- single-broker KRaft mode (no ZooKeeper).
+# Milestone 5 (this): api, ui, tick-producer, stream-consumer — the producer
+#                                and consumer move from plain WSL2 processes
+#                                into containers, and the service split from
+#                                Milestone 4 becomes two real images.
 # Milestone 6 adds:  prometheus, grafana
 #
-# On an 8 GB machine these are brought up in subsets (see README "Running
-# locally") - e.g. `docker compose up kafka` alone, without also running
-# Airflow/Spark at the same time. CI brings up what each milestone needs as
-# its own end-to-end proof.
+# PROFILES. On an 8 GB machine you do not run all of this at once. Services
+# without a `profiles` key start by default; the heavier ones are opt-in:
+#
+#   docker compose up                                        # kafka + api + ui
+#   docker compose --profile streaming up                    # + producer/consumer
+#   docker compose --profile orchestration up                # + airflow
+#   docker compose --profile streaming --profile orchestration up   # everything
+#
+# The default set (kafka, api, ui) is the product surface plus the broker it
+# will need, and fits comfortably. Spark and Airflow are the memory-hungry
+# ones, so they stay behind a flag.
 
 name: realtime-lakehouse-rag-pipeline
+
+# Anchor shared by the two streaming services: same image, same environment,
+# different command. Keeps them from drifting apart.
+x-streaming: &streaming
+  build:
+    context: ..
+    dockerfile: infra/Dockerfile.streaming
+  image: rlrp-streaming:local
+  environment:
+    # kafka:19092 is the in-network listener; host processes use localhost:9092.
+    KAFKA_BOOTSTRAP_SERVERS: "kafka:19092"
+    KAFKA_TICKS_TOPIC: "market.ticks"
+    DELTA_TICKS_RAW: "/app/data/delta/ticks_raw"
+    # Checkpoints live on a named volume, NOT under the bind-mounted ../data.
+    # Spark chmods its checkpoint directory, which fails on a Windows-backed
+    # bind mount ("chmod: ... Operation not permitted") and kills the query on
+    # startup. A named volume is a real Linux filesystem, and checkpoints are
+    # runtime state rather than user data, so this is where they belong anyway.
+    STREAM_CHECKPOINT_DIR: "/checkpoints/ticks_stream"
+  volumes:
+    - ../data:/app/data
+    - stream-checkpoints:/checkpoints
+  depends_on:
+    kafka:
+      condition: service_healthy
+  restart: unless-stopped
 
 services:
   kafka:
@@ -39,9 +66,8 @@ services:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
       # PLAINTEXT (19092) is for other containers on this compose network
-      # (e.g. Milestone 5's containerized stream-consumer); PLAINTEXT_HOST
-      # (9092) is for host-side processes - what tick_producer.py /
-      # stream_consumer.py use today, running as plain WSL2 processes.
+      # (the containerized stream-consumer); PLAINTEXT_HOST (9092) is for
+      # host-side processes.
       KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:19092,CONTROLLER://0.0.0.0:9093,PLAINTEXT_HOST://0.0.0.0:9092"
       KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:19092,PLAINTEXT_HOST://localhost:9092"
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
@@ -49,6 +75,10 @@ services:
       KAFKA_CONTROLLER_QUORUM_VOTERS: "1@localhost:9093"
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Pre-create the topic so the consumer can't lose the race against it.
+      # Spark's Kafka source fails hard on UnknownTopicOrPartitionException
+      # with no retry - found the hard way in Milestone 2.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
       CLUSTER_ID: "ciWo7IWazngRchmPES6q5A=="
     healthcheck:
       # kafka-broker-api-versions.sh spins up a small JVM client - on this
@@ -62,10 +92,75 @@ services:
       retries: 5
       start_period: 30s
 
+  api:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.api
+    image: rlrp-api:local
+    container_name: rlrp-api
+    ports:
+      - "8000:8000"
+    environment:
+      DELTA_OHLCV_RAW: "/app/data/delta/ohlcv_raw"
+      DELTA_OHLCV_CURATED: "/app/data/delta/ohlcv_curated"
+      DELTA_TICKS_RAW: "/app/data/delta/ticks_raw"
+      VECTORSTORE_DIR: "/app/data/vectorstore"
+      BRIEFINGS_DIR: "/app/data/briefings"
+      CONTEXT_DOCS_DIR: "/app/docs/context"
+      # Ollama runs on the host, not in compose - it is a 4.7GB model server
+      # that would dwarf this stack, and it is already installed natively.
+      # Reaching it from a container needs the host gateway AND ollama bound
+      # beyond loopback (OLLAMA_HOST=0.0.0.0 on the host). Without that, the
+      # read endpoints all work and only POST /briefings returns 502.
+      OLLAMA_HOST: "http://host.docker.internal:11434"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ../data:/app/data
+      # Read-only: the API retrieves from the index, it never rebuilds it.
+      - ../docs/context:/app/docs/context:ro
+    restart: unless-stopped
+
+  ui:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.ui
+    image: rlrp-ui:local
+    container_name: rlrp-ui
+    ports:
+      - "8501:8501"
+    environment:
+      # The payoff for keeping API_BASE_URL separate from API_HOST/API_PORT in
+      # Milestone 4: the UI dials a service name here, and the API's own
+      # binding is unchanged.
+      API_BASE_URL: "http://api:8000"
+      API_BRIEFING_TIMEOUT_SECONDS: "900"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # `--duration 0` / `--timeout 0` mean "run until stopped". Both modules
+  # defaulted to a bounded run (30s / 60s) because Milestone 2 only needed
+  # verification runs - left as-is, `restart: unless-stopped` would turn them
+  # into restart loops instead of services.
+  tick-producer:
+    <<: *streaming
+    container_name: rlrp-tick-producer
+    command: ["python", "-m", "src.streaming.tick_producer", "--duration", "0"]
+    profiles: ["streaming"]
+
+  stream-consumer:
+    <<: *streaming
+    container_name: rlrp-stream-consumer
+    command: ["python", "-m", "src.streaming.stream_consumer", "--timeout", "0"]
+    profiles: ["streaming"]
+
   airflow:
     build:
       context: ..
       dockerfile: infra/Dockerfile.airflow
+    image: rlrp-airflow:local
     container_name: rlrp-airflow
     command: standalone
     environment:
@@ -83,6 +178,10 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
+    profiles: ["orchestration"]
 
 volumes:
   airflow-state:
+  # Spark Structured Streaming checkpoints. Deliberately a named volume rather
+  # than a host bind mount - see STREAM_CHECKPOINT_DIR above.
+  stream-checkpoints:

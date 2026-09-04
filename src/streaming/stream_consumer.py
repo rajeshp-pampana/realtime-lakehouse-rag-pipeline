@@ -141,6 +141,11 @@ def run_consumer(
 ) -> dict:
     """Consume ``topic`` from Kafka and append micro-batches into the ticks
     Delta table for up to ``timeout_seconds``, then stop and return metrics.
+
+    A ``timeout_seconds`` of 0 or less runs until terminated. Milestone 2 only
+    needed bounded verification runs; Milestone 5 runs this as a long-lived
+    container, where a bounded run under ``restart: unless-stopped`` would be a
+    restart loop rather than a service.
     """
     from pyspark.sql import functions as F
 
@@ -173,7 +178,10 @@ def run_consumer(
             .trigger(processingTime="2 seconds")
             .start()
         )
-        query.awaitTermination(timeout=timeout_seconds)
+        if timeout_seconds <= 0:
+            query.awaitTermination()
+        else:
+            query.awaitTermination(timeout=timeout_seconds)
         query.stop()
     finally:
         spark.stop()

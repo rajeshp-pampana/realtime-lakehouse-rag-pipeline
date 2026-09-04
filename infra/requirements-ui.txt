@@ -1,0 +1,24 @@
+# Runtime dependencies for the Streamlit console image (infra/Dockerfile.ui).
+# Subset of the top-level requirements.txt - see infra/requirements-api.txt for
+# why the split exists and why versions must stay in sync with that file.
+#
+# Note what is absent: no deltalake, no pyspark, no chromadb, no ollama. Since
+# Milestone 4 the console is a thin client - it reaches pipeline data over HTTP
+# and never opens a Delta table or runs inference, so its image has no reason to
+# carry the machinery that does. The image is a check on that claim: if the UI
+# ever regressed to reading data directly, it would fail here.
+
+# --- Config ---
+python-dotenv>=1.0,<2.0
+
+# --- Console ---
+streamlit>=1.38,<1.50
+plotly>=5.22,<6.0
+pandas>=2.2,<2.3
+
+# --- Talking to the API ---
+httpx>=0.27,<0.29
+
+# --- Presentation-only lookups that never enter the Lakehouse ---
+# (fundamentals, earnings, news - see README "Where the UI gets its data")
+yfinance>=0.2.50,<0.3

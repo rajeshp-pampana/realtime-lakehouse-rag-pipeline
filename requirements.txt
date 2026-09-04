@@ -37,6 +37,10 @@ ollama>=0.4,<0.6
 ruff>=0.8,<0.9
 pytest>=8.2,<9.0
 pytest-cov>=5.0,<7.0
+# Used by tests/test_infra.py to parse infra/docker-compose.yml. It is already
+# present transitively (via chromadb/uvicorn), but a test must not depend on
+# another package's transitive dep - that can vanish in a patch release.
+pyyaml>=6.0,<7.0
 
 # --- Streaming (Milestone 2) ---
 kafka-python-ng>=2.2,<3.0

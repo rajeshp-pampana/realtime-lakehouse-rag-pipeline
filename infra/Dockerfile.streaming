@@ -1,13 +1,75 @@
-# Spark Structured Streaming consumer image. Fully wired in Milestone 5.
-# Needs a JRE for local-mode Spark; base image finalised in Milestone 5.
-FROM python:3.12-slim
+# Streaming image: Kafka tick producer and Spark Structured Streaming consumer.
+#
+# One image, two commands - they share every dependency and differ only in
+# entrypoint, so a second build for ~40 lines of producer code would be waste.
+# Compose overrides `command` per service.
+#
+# This is the one image that genuinely needs a JVM: the consumer runs real
+# Spark. The API deliberately doesn't (see infra/Dockerfile.api).
+#
+# Pinned to -bookworm (Debian 12) rather than the floating -slim tag. The
+# floating tag moved to Debian 13 (trixie), which dropped openjdk-17 - this
+# build failed with "Package 'openjdk-17-jre-headless' has no installation
+# candidate" the moment that happened upstream. Java 17 is not an arbitrary
+# preference: Spark 3.5.x supports Java 8/11/17, and CI tests on Temurin 17, so
+# taking trixie's openjdk-21 would put the container off the supported matrix
+# and out of step with CI. Pin the OS, keep the JDK.
+FROM python:3.12-slim-bookworm
 
-RUN apt-get update && apt-get install -y --no-install-recommends openjdk-17-jre-headless \
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends openjdk-17-jre-headless procps \
+    && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
+ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
 
 WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+
+COPY infra/requirements-streaming.txt ./requirements-streaming.txt
+RUN pip install --no-cache-dir -r requirements-streaming.txt
 
 COPY src ./src
+
+# Spark resolves the Kafka connector JARs through Ivy at query start. Give it a
+# writable cache inside the image so a container doesn't re-download them into
+# a root-owned default path (and so a cold start isn't also a network fetch).
+ENV IVY_HOME=/home/appuser/.ivy2 \
+    SPARK_LOCAL_DIRS=/tmp/spark
+
+# /checkpoints is where the stream-checkpoints named volume gets mounted.
+# It must exist AND be owned by appuser in the image: Docker initialises an
+# empty named volume from the image's directory at that path, ownership
+# included. Without this the volume arrives root-owned and Spark dies with
+# "java.io.IOException: mkdir of file:/checkpoints/ticks_stream failed",
+# because uid 10001 cannot create anything inside it.
+RUN useradd --create-home --uid 10001 appuser \
+    && mkdir -p /home/appuser/.ivy2 /tmp/spark /app/data /checkpoints \
+    && chown -R appuser:appuser /app /home/appuser /tmp/spark /checkpoints
+USER appuser
+
+# Pre-resolve the Spark Kafka connector at BUILD time.
+#
+# stream_consumer.py sets `spark.jars.packages`, which makes Spark fetch these
+# JARs from Maven Central via Ivy when the streaming query starts. In a
+# container that means every cold start needs working network access to Maven
+# and pays the download - a runtime dependency on the public internet for a
+# service that otherwise only needs Kafka. Resolving once here bakes the JARs
+# into the image's Ivy cache, so containers start offline and fast.
+#
+# Must match _KAFKA_PACKAGE in src/streaming/stream_consumer.py; a test asserts
+# the two stay in step (tests/test_infra.py).
+ARG KAFKA_PACKAGE=org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.3
+RUN python -c "\
+from pyspark.sql import SparkSession; \
+s = SparkSession.builder.master('local[1]') \
+    .config('spark.jars.packages', '${KAFKA_PACKAGE}') \
+    .config('spark.ui.enabled', 'false') \
+    .config('spark.driver.host', 'localhost') \
+    .getOrCreate(); \
+print('resolved:', s.conf.get('spark.jars.packages')); \
+s.stop()"
+
 CMD ["python", "-m", "src.streaming.stream_consumer"]

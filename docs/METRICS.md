@@ -29,6 +29,22 @@ placeholder in the CV Projects section.
 | **API latency, `GET /api/v1/ticks/{ticker}`** | **p50 55.93ms, p95 66.99ms** | 2026-09-04 | Same harness, against the real 765-row `ticks_raw` table. ~2.3x the `prices` endpoint: same code path, but this table is at Delta version 16 (17 commits from the streaming micro-batches) vs version 0, so there is more transaction log to replay | M4 |
 | **API latency, `GET /api/v1/lakehouse/stats`** | **p50 86.83ms, p95 164.04ms** (min 57.36, max 278.24) | 2026-09-04 | Same harness. Reads all three tables in full, so it costs roughly the sum of the others - the widest p50/p95 spread of any endpoint | M4 |
 | **API latency, `POST /api/v1/briefings/{ticker}`** | **521.48s end-to-end over HTTP** (retrieval 1.512s + generation 516.13s) | 2026-09-04 | Single real request to the running server; the full path (Delta read -> Chroma retrieval -> Ollama generation -> briefing saved to `data/briefings/`) returned 200. Cold model load again - `llama3` had been evicted by the time this ran, so it matches the 480.28s cold figure above, not the 65-93s warm one. No p50/p95: a single sample, and quoting percentiles off one call would be fake precision. Sources retrieved: 2 prior briefings + `tickers.md` + `schema_notes.md` | M4 |
+| **Container image size, API** | **980 MB** (down from 1.17 GB before pruning) | 2026-09-04 | `docker images` on the built `rlrp-api:local`. The 190 MB drop is `pip uninstall kubernetes onnxruntime` in the install layer - chromadb transitive deps this project never uses (see below) | M5 |
+| **Container image size, UI** | **1.09 GB** | 2026-09-04 | `docker images` on `rlrp-ui:local`. Contains no `deltalake`/`pyspark`/`chromadb`/`ollama` - verified by `importlib.util.find_spec` inside the running image, not just by reading the requirements file | M5 |
+| **Container image size, streaming** | **1.75 GB** (before baking the Kafka JARs) | 2026-09-04 | `docker images` on `rlrp-streaming:local`. The largest by far and legitimately so: it is the only image carrying a JVM (openjdk-17-jre-headless) plus pyspark | M5 |
+| **Image build time (cold, on this machine)** | **API 521s, UI 283s, streaming 847s** | 2026-09-04 | Wall clock around `docker compose build <svc>`. Dominated by the build context living on `/mnt/c`, which Docker-in-WSL2 reaches over the 9p filesystem - a dev-environment cost, not a CI number. A cached rebuild of an unchanged image is 6s | M5 |
+| **Containerized streaming, end to end** | **918 new rows landed in 76s** (ticks_raw 765 -> 1683, Delta version 16 -> 22) | 2026-09-04 | `docker compose --profile streaming up`: tick producer *container* -> Kafka *container* -> Spark Structured Streaming consumer *container* -> Delta, read back through the API. Baseline row count read from the live API before starting (see note below on why that matters), so these are genuinely new rows, not pre-existing ones | M5 |
+| **Compose stack cold start** (kafka + api + ui) | **27s** to all-healthy; API healthy in 1-9s, UI in 8s | 2026-09-04 | Wall clock from `docker compose up -d` to both `/health` and `/_stcore/health` returning 200 | M5 |
+| **Runtime memory, default stack** (kafka + api + ui) | **~486 MB total**: API 89 MB, UI 46 MB, Kafka 352 MB | 2026-09-04 | `docker stats --no-stream` against WSL2's 3.76 GiB allocation | M5 |
+| **Runtime memory, full streaming stack** | **~1.27 GB total**: Spark consumer 622 MB, Kafka 395 MB, API 116 MB, producer 89 MB, UI 49 MB | 2026-09-04 | `docker stats --no-stream` with the streaming profile up. The Spark consumer is the single largest component, as expected | M5 |
+| **Spark Kafka JAR resolution in-container** | **0 kB downloaded, 11 artifacts already retrieved (24-267ms)** | 2026-09-04 | Ivy retrieve summary in the consumer's logs. The connector JARs are baked into the image at build time, so a cold container start needs no Maven access | M5 |
+| **Kubernetes deploy, plain manifests** | **8 resources applied, both Deployments ready, 0 restarts** | 2026-09-04 | `kubectl apply -f infra/k8s/` on a real kind cluster (k8s v1.37.0): Namespace, ConfigMap, 2 Deployments, 4 Services. API reachable on localhost:8000 in 1s via NodePort, UI HTTP 200 on 8501 | M5 |
+| **Kubernetes deploy, Helm chart** | **`helm install` STATUS deployed; 1/1 + 1/1 ready; 0 restarts** | 2026-09-04 | `helm install rlrp infra/k8s/helm/rlrp -n rlrp --create-namespace --wait`. Release rlrp-0.1.0, appVersion 1.0.0 | M5 |
+| **Helm upgrade path** | **api scaled 1 -> 2 replicas, 2/2 ready; revision 1 superseded -> 2 deployed** | 2026-09-04 | `helm upgrade --set api.replicaCount=2 --wait`, confirmed with `helm history` | M5 |
+| **UI -> API over in-cluster DNS** | **UI pod fetched real curated MSFT bars from `http://rlrp-api:8000`** | 2026-09-04 | `kubectl exec` into the UI pod, reading its own `API_BASE_URL`. Same substitution compose made with `http://api:8000` - the Milestone 4 split carried to k8s unchanged | M5 |
+| **kind cluster stability (soak test)** | **23 min continuous, 0 pod restarts** - 21 samples at 60s intervals, every one healthy | 2026-09-04 | Sampled node status, pod readiness, `/health`, UI HTTP and restart counts every 60s for 20 min. Final state: 3/3 pods Running (ages 20-21m), helm release still `deployed` at revision 2, API still serving real curated MSFT bars. `dockerd` showed `NRestarts=0` throughout, confirming the distro was never torn down. Before the keep-alive fix the node died within 1-3 minutes | M5 |
+| **kind cluster creation** | **~60-90s** to Ready (node image ~1 GB, pulled once) | 2026-09-04 | `kind create cluster --config infra/k8s/kind-cluster.yaml` | M5 |
+| **`kind load docker-image`** | **48s (api), 57s (ui)** | 2026-09-04 | Required because there is no registry; images are 227 MB / 217 MB as stored by containerd in the node | M5 |
 | CI pipeline duration (lint + test + build) | _tbd_ | | | M6 |
 
 ## Milestone 3 "Done when" proof: a briefing citing retrieved context
@@ -87,6 +103,139 @@ than hypothetical: push the predicate down into the Parquet scan
 (`DeltaTable.to_pyarrow_dataset()` with a filter, or partition the tables by
 `Ticker`) so the reader touches only the relevant files. Recorded here as a
 known, measured limitation rather than presented as a finished result.
+
+## Milestone 5 note: what the per-service dependency split actually bought
+
+Worth recording honestly, because the obvious expectation was wrong. Splitting
+`requirements.txt` into per-image files (`infra/requirements-*.txt`) was
+expected to make the UI image much smaller than the API's. It didn't: **1.09 GB
+vs 980 MB**, and before the API's dependency pruning the UI was actually the
+*smaller* of the two by only ~7%. Both images are dominated by the same
+scientific-Python core - pandas, numpy and pyarrow - which Streamlit pulls in
+regardless of what the console does with it.
+
+So the split's value is not primarily size. It is:
+
+- **The streaming image is the only one carrying a JVM.** pyspark +
+  openjdk-17-jre-headless is what makes it 1.75 GB; keeping that out of the API
+  and UI is the real saving, and it is structural rather than incidental.
+- **It makes the thin-client boundary physical.** The UI image has no
+  `deltalake`, `pyspark`, `chromadb` or `ollama` at all, so a regression to
+  reading data or running inference directly fails at import inside the
+  container instead of silently working in dev.
+
+The genuine size win came from somewhere else entirely: **chromadb pulls
+`kubernetes` (83 MB) and `onnxruntime` (66 MB)** as transitive dependencies,
+neither of which this project uses. Removing them took the API image from
+1.17 GB to 980 MB (site-packages 739 MB -> 591 MB).
+
+That removal is safe for a reason that traces back to Milestone 3:
+`src/rag/_chromadb_compat.py` already stubs `sys.modules["onnxruntime"]` to
+work around a Windows DLL conflict, so chromadb's default embedding function -
+the only thing that wants onnxruntime - never touches the real package on any
+platform. A Windows-specific workaround turned out to be what makes a
+Linux image 190 MB smaller. Verified rather than assumed: chromadb import,
+upsert, query and graceful degradation were all exercised with both packages
+uninstalled, and the compose smoke test re-checks it inside the built image.
+
+## Milestone 5 note: four bugs that only exist inside a container
+
+None of these were visible in the dev venv, in CI, or in the test suite before
+this milestone. They are recorded because they are the substance of what
+containerization actually surfaced - and because in three of four cases the
+naive health signal ("the container is Up") was green while the thing was
+broken.
+
+1. **`yfinance` missing in the streaming image.** `tick_producer.py` imported
+   `TICKERS` from `ingestion/fetch_market_data.py`, which imports yfinance at
+   module level. The producer invents ticks and never calls Yahoo Finance, so
+   it had no business importing that module. Crash-looped with
+   `ModuleNotFoundError`. Same coupling had already been fixed for the API -
+   fixing one importer and not auditing the rest is what let it survive.
+   `TICKERS` now lives in `src/config.py`.
+2. **Spark cannot checkpoint onto a Windows-backed bind mount.** Spark chmods
+   its checkpoint directory; on `/mnt/c` as a non-root user that fails with
+   `chmod: ... Operation not permitted`, killing the query at startup. Fixed by
+   moving checkpoints to a named volume, which is where runtime state belongs
+   anyway.
+3. **Named volumes are created root-owned.** Fixing (2) moved the error rather
+   than removing it: `java.io.IOException: mkdir of file:/checkpoints/... failed`,
+   because the container runs as uid 10001. Docker initialises an empty named
+   volume from the image's directory at that path *including ownership*, so the
+   fix is `mkdir /checkpoints && chown appuser` in the Dockerfile - not
+   anything in compose. An already-created volume keeps its old ownership, so
+   the stale volume had to be removed too.
+4. **The producer logged nothing at all.** `run_producer` only printed metrics
+   when it finished, which in run-until-stopped mode never happens - so
+   `docker logs` was empty for five minutes and "is it publishing?" could not
+   be answered. It now logs a startup line and a 30s heartbeat with count and
+   rate.
+
+**A verification bug worth recording too**, since it nearly produced a false
+pass: the first version of the streaming check read its baseline row count
+before starting the stack. The API was down, `curl` failed, and the script
+fell back to `0` - which would have reported the 765 rows already written by
+Milestone 2's *non-containerized* processes as newly landed, "proving"
+containerized streaming worked without a single new row. The check now reads
+the baseline only after the API is healthy and aborts outright if it cannot,
+because a test whose baseline silently defaults to zero cannot fail.
+
+Related: `found ... in central` in Ivy's output was initially misread as
+evidence of a runtime Maven download. Ivy prints that even when resolving
+entirely from local cache - "central" names the resolver that originally
+supplied the module, not the source of this resolution. The decisive signal is
+the retrieve summary's byte count (`0 kB`).
+
+## Milestone 5 note: why the kind node kept dying (and the wrong first answer)
+
+Worth recording because the first diagnosis was wrong, and the evidence that
+corrected it was specific.
+
+**Symptom.** The kind node container shut down on its own after roughly 1-3
+minutes. Not memory: `OOMKilled=false`, ~5.3 GB of WSL2's 5.86 GB free,
+`systemd-oomd` inactive. The node's own logs showed an orderly systemd
+shutdown (`Reached target umount.target`), so something was asking it to stop.
+Restarting it afterwards failed with:
+
+```
+runc create failed: unable to apply cgroup configuration:
+error creating systemd unit `docker-<id>.scope`: got `failed`
+```
+
+**First (wrong) conclusion.** Docker here runs the systemd cgroup driver on
+cgroup v2 under systemd PID 1 - the known-fragile combination for kind - so
+this looked like it needed `native.cgroupdriver=cgroupfs` in
+`/etc/docker/daemon.json` plus a Docker restart, i.e. root access this WSL user
+does not have.
+
+**What actually showed the real cause.** `systemctl show docker` reported
+`ExecMainStartTimestamp` four seconds in the past with `NRestarts=0`, while WSL
+itself had been up for 31 minutes. Docker had not *restarted*; it had been
+stopped and freshly started at the moment of reconnecting. The distro's
+services are torn down when no process holds the distro open, and the kind node
+dies with them. The cgroup error is what happens *afterwards*, when Docker
+tries to restart a container whose runtime state went away with the teardown -
+a consequence, not the cause.
+
+**Fix, no root required.** Hold a long-lived process open in the distro. The
+same keep-alive technique this project already used in Milestone 2 to stop
+WSL2 idling out from under a running Kafka broker.
+
+**Verified by soak test**, not by finishing quickly: with the keep-alive in
+place, the cluster was sampled every 60s for 20 minutes - node status, pod
+readiness, API `/health`, UI HTTP, and restart counts. Every sample healthy,
+0 pod restarts, versus a node that previously died inside 1-3 minutes.
+
+Two smaller things worth knowing:
+
+- `kubectl apply --dry-run=server` on `infra/k8s/deployment.yaml` reports
+  `namespaces "rlrp" not found`. A server dry-run does not actually create the
+  Namespace the same file defines, so the namespaced objects have nothing to
+  validate against. It is a property of dry-run, not a manifest defect - the
+  real apply creates all 8 resources cleanly.
+- `/tmp` inside this WSL distro does not survive the service teardown described
+  above, so verification scripts are fed to bash by process substitution from
+  `/mnt/c` rather than staged in `/tmp`.
 
 ## Machine baseline (for context on all timings)
 

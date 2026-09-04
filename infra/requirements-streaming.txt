@@ -1,0 +1,24 @@
+# Runtime dependencies for the streaming images (infra/Dockerfile.streaming) -
+# both the Kafka tick producer and the Spark Structured Streaming consumer.
+# Subset of the top-level requirements.txt - see infra/requirements-api.txt for
+# why the split exists and why versions must stay in sync with that file.
+#
+# This is the one image that genuinely needs a JVM: the consumer runs real
+# Spark Structured Streaming. The producer is pure Python and could be smaller
+# still, but the two share an image to avoid a third build for ~40 lines of
+# code; they differ only in their command.
+
+# --- Config ---
+python-dotenv>=1.0,<2.0
+
+# --- Kafka ---
+kafka-python-ng>=2.2,<3.0
+
+# --- Spark + Delta sink ---
+pandas>=2.2,<2.3
+pyarrow>=17,<19
+deltalake>=0.21,<0.25
+pyspark==3.5.3
+# PySpark 3.5.x still does `from distutils.version import LooseVersion`, and
+# distutils left the stdlib in Python 3.12; setuptools restores the shim.
+setuptools>=70

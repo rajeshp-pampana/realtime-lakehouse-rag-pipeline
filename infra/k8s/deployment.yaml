@@ -1,3 +1,133 @@
-# Kubernetes Deployments for the API, UI, and streaming consumer.
-# Authored and validated (kind + kubeconform in CI) in Milestone 5.
-# Placeholder until then.
+# Kubernetes Deployments for the API and the Streamlit console.
+#
+# These plain manifests are the readable, no-Helm path:
+#   kubectl apply -f infra/k8s/
+# The Helm chart in infra/k8s/helm/rlrp renders the same resources with values
+# for image tags, replicas and namespace; see the README for which to use when.
+#
+# Images are local (built by `docker compose build`, loaded with
+# `kind load docker-image`), so imagePullPolicy MUST be IfNotPresent. The
+# default for a non-:latest tag is IfNotPresent, but stating it is the
+# difference between "works" and "ImagePullBackOff trying to reach a registry
+# that has never heard of rlrp-api".
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: rlrp
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rlrp-config
+  namespace: rlrp
+data:
+  # The lakehouse paths inside the pod. The Delta tables come from the host via
+  # the kind node's extraMounts -> a hostPath volume.
+  DELTA_OHLCV_RAW: "/app/data/delta/ohlcv_raw"
+  DELTA_OHLCV_CURATED: "/app/data/delta/ohlcv_curated"
+  DELTA_TICKS_RAW: "/app/data/delta/ticks_raw"
+  VECTORSTORE_DIR: "/app/data/vectorstore"
+  BRIEFINGS_DIR: "/app/data/briefings"
+  # In-cluster DNS: the UI dials the API's Service by name. Same substitution
+  # compose made with http://api:8000 - which is why API_BASE_URL was kept
+  # separate from the API's own bind address back in Milestone 4.
+  API_BASE_URL: "http://rlrp-api:8000"
+  API_BRIEFING_TIMEOUT_SECONDS: "900"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rlrp-api
+  namespace: rlrp
+  labels: { app.kubernetes.io/name: rlrp, app.kubernetes.io/component: api }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: rlrp, app.kubernetes.io/component: api }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: rlrp, app.kubernetes.io/component: api }
+    spec:
+      securityContext:
+        # Matches the uid the image creates. Delta reads come from a hostPath,
+        # so the pod must run as the user that can read it.
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: api
+          image: rlrp-api:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef: { name: rlrp-config }
+          volumeMounts:
+            - name: lakehouse
+              mountPath: /app/data
+          # /health deliberately has no lakehouse or model dependency, so a
+          # not-yet-populated Delta table can't make the pod look unhealthy.
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 20
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits:   { cpu: "1",  memory: 768Mi }
+      volumes:
+        - name: lakehouse
+          hostPath:
+            # Provided by the kind node's extraMounts (see kind-cluster.yaml).
+            path: /lakehouse
+            type: Directory
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rlrp-ui
+  namespace: rlrp
+  labels: { app.kubernetes.io/name: rlrp, app.kubernetes.io/component: ui }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: rlrp, app.kubernetes.io/component: ui }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: rlrp, app.kubernetes.io/component: ui }
+    spec:
+      securityContext:
+        runAsUser: 10001
+        runAsGroup: 10001
+      containers:
+        - name: ui
+          image: rlrp-ui:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8501
+          envFrom:
+            - configMapRef: { name: rlrp-config }
+          # No lakehouse mount: since Milestone 4 the console is a thin HTTP
+          # client. It has no volume because it needs no data - the same
+          # boundary the UI image enforces by shipping no deltalake/pyspark.
+          readinessProbe:
+            httpGet: { path: /_stcore/health, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 12
+          livenessProbe:
+            httpGet: { path: /_stcore/health, port: http }
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests: { cpu: 100m, memory: 192Mi }
+            limits:   { cpu: "1",  memory: 640Mi }

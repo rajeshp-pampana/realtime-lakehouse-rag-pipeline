@@ -1,11 +1,38 @@
-# Streamlit analyst console image. Fully wired in Milestone 5.
-FROM python:3.12-slim
+# Streamlit analyst console image.
+#
+# Installs infra/requirements-ui.txt only - no deltalake, no pyspark, no
+# chromadb, no ollama. Since Milestone 4 the console is a thin client that
+# reaches pipeline data over HTTP, so this image has no way to read a Delta
+# table or run inference even if someone tried: the packages aren't there.
+# Pinned to -bookworm rather than the floating -slim tag, which silently moved
+# to Debian 13 and broke the streaming image's JDK install. All three images
+# share one pinned base so they can't drift apart under us.
+FROM python:3.12-slim-bookworm
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
 
+COPY infra/requirements-ui.txt ./requirements-ui.txt
+RUN pip install --no-cache-dir -r requirements-ui.txt
+
+# Only what the thin client actually needs: the console itself, plus
+# src/config.py (which api_client reads settings from). The rest of src/ -
+# ingestion, processing, streaming, rag, llm - is deliberately absent.
 COPY ui ./ui
-COPY src ./src
+COPY src/__init__.py ./src/__init__.py
+COPY src/config.py ./src/config.py
+
+RUN useradd --create-home --uid 10001 appuser && chown -R appuser:appuser /app
+USER appuser
+
 EXPOSE 8501
-CMD ["streamlit", "run", "ui/streamlit_app.py", "--server.address=0.0.0.0", "--server.port=8501"]
+
+HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=5 \
+    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8501/_stcore/health', timeout=4).status==200 else 1)"
+
+CMD ["streamlit", "run", "ui/streamlit_app.py", \
+     "--server.address=0.0.0.0", "--server.port=8501", \
+     "--server.headless=true", "--browser.gatherUsageStats=false"]

@@ -1,0 +1,20 @@
+{{ .Chart.Name }} {{ .Chart.Version }} installed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+Wait for both Deployments to become available:
+  kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ .Release.Name }}-api
+  kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ .Release.Name }}-ui
+
+With the kind cluster from infra/k8s/kind-cluster.yaml, the NodePorts are
+mapped to the host:
+  API   http://localhost:{{ .Values.api.service.nodePort | default 30800 }}  -> /docs, /health
+  UI    http://localhost:{{ .Values.ui.service.nodePort | default 30851 }}
+
+Inside the cluster the UI reaches the API at:
+  http://{{ .Release.Name }}-api:{{ .Values.api.service.port }}
+
+{{- if not .Values.config.ollamaHost }}
+
+NOTE: config.ollamaHost is unset, so POST /api/v1/briefings will return 502.
+Every read endpoint works. Ollama runs on the host by design (a 4.7GB model
+server would dominate a laptop cluster); set config.ollamaHost to reach it.
+{{- end }}

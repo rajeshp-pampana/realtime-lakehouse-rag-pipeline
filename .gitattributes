@@ -1,0 +1,27 @@
+# Line endings.
+#
+# This repo is developed on Windows but every container runs Linux, and files
+# that a Linux shell interprets must not arrive with CRLF: a Dockerfile RUN
+# line or a shell script with \r fails in ways that read as nonsense
+# ("bad interpreter", "command not found" with an invisible character). Git's
+# autocrlf setting is per-machine, so pin the behaviour here instead of hoping
+# every clone is configured the same way.
+
+# Default: normalise to LF in the repo, let Git decide the working copy.
+* text=auto eol=lf
+
+# Files consumed by a Linux shell or Docker - always LF, no exceptions.
+*.sh            text eol=lf
+Dockerfile*     text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+
+# Windows-only scripts keep CRLF.
+*.bat           text eol=crlf
+*.ps1           text eol=crlf
+
+# Binary: never touch.
+*.png           binary
+*.jpg           binary
+*.parquet       binary
+*.whl           binary

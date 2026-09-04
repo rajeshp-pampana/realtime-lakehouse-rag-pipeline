@@ -1,0 +1,8 @@
+apiVersion: v2
+name: rlrp
+description: Realtime Lakehouse RAG Pipeline - FastAPI service and Streamlit console
+type: application
+# Chart version tracks packaging changes; appVersion tracks the software.
+version: 0.1.0
+appVersion: "1.0.0"
+keywords: [lakehouse, delta, kafka, rag, fastapi, streamlit]

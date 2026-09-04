@@ -16,14 +16,22 @@ import random
 import time
 from datetime import UTC, datetime
 
+# TICKERS comes from config, not from ingestion/fetch_market_data: importing it
+# from there pulls yfinance into the streaming image, which doesn't ship it (the
+# producer invents ticks, it never calls Yahoo Finance). Same coupling the API
+# hit - see the note in src/config.py.
 from src import config
-from src.ingestion.fetch_market_data import TICKERS
+from src.config import TICKERS
 
 TOPIC = config.KAFKA_TICKS_TOPIC
 
 # Per-tick move: uniform +/-30bps, tuned to look like plausible intraday noise
 # without the walk exploding over a short demo run.
 _MAX_TICK_MOVE = 0.003
+
+# How often the run-until-stopped producer logs progress. Only used in that
+# mode; a bounded run still reports its metrics once at the end.
+_HEARTBEAT_SECONDS = 30.0
 
 
 def _load_last_closes() -> dict[str, float]:
@@ -57,6 +65,11 @@ def run_producer(
 ) -> dict:
     """Publish simulated tick events for ``duration_seconds``, one round (all
     tickers) every ``interval_seconds``. Returns a metrics dict.
+
+    A ``duration_seconds`` of 0 or less runs indefinitely. Milestone 2 only
+    ever needed bounded verification runs, but Milestone 5 runs this as a
+    long-lived container: a bounded run under ``restart: unless-stopped`` is a
+    restart loop, not a service.
     """
     tickers = tickers or TICKERS
     interval_seconds = config.TICK_INTERVAL_SECONDS if interval_seconds is None else interval_seconds
@@ -67,7 +80,19 @@ def run_producer(
     started = time.perf_counter()
     published = 0
     try:
-        while time.perf_counter() - started < duration_seconds:
+        run_forever = duration_seconds <= 0
+        if run_forever:
+            # A service that only reports at the end reports nothing at all.
+            # Without this the container logged absolutely nothing while
+            # running, which made "is it publishing?" unanswerable from
+            # `docker logs` during Milestone 5 debugging.
+            print(
+                f"[tick_producer] publishing to {TOPIC} every {interval_seconds}s "
+                f"for {len(tickers)} tickers (run-until-stopped)",
+                flush=True,
+            )
+        last_heartbeat = started
+        while run_forever or time.perf_counter() - started < duration_seconds:
             round_started = time.perf_counter()
             for ticker in tickers:
                 prices[ticker] *= 1 + random.uniform(-_MAX_TICK_MOVE, _MAX_TICK_MOVE)
@@ -80,6 +105,17 @@ def run_producer(
                 producer.send(TOPIC, key=ticker, value=event)
                 published += 1
             producer.flush()
+
+            now = time.perf_counter()
+            if run_forever and now - last_heartbeat >= _HEARTBEAT_SECONDS:
+                elapsed = now - started
+                print(
+                    f"[tick_producer] published={published} "
+                    f"elapsed={elapsed:.0f}s rate={published / elapsed:.2f}/s",
+                    flush=True,
+                )
+                last_heartbeat = now
+
             sleep_for = interval_seconds - (time.perf_counter() - round_started)
             if sleep_for > 0:
                 time.sleep(sleep_for)

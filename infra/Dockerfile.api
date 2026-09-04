@@ -1,10 +1,56 @@
-# FastAPI service image. Fully wired in Milestone 5.
-FROM python:3.12-slim
+# FastAPI service image.
+#
+# Installs infra/requirements-api.txt, not the top-level requirements.txt: the
+# API reads Delta through delta-rs and never imports Spark, Streamlit or
+# yfinance, so none of those belong in this image. See the header of
+# infra/requirements-api.txt.
+# Pinned to -bookworm rather than the floating -slim tag, which silently moved
+# to Debian 13 and broke the streaming image's JDK install. All three images
+# share one pinned base so they can't drift apart under us.
+FROM python:3.12-slim-bookworm
+
+# Fail fast and log straight through to the container's stdout rather than
+# sitting in a buffer - matters when the only view of a service is `docker logs`.
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+
+# Dependencies first, as their own layer: source changes are frequent and
+# dependency changes are rare, so this keeps rebuilds off the slow path.
+COPY infra/requirements-api.txt ./requirements-api.txt
+# chromadb pulls two large transitive dependencies this project never uses:
+#   kubernetes  (83MB) - chromadb's k8s deployment support.
+#   onnxruntime (66MB) - backs chromadb's *default* embedding function, which
+#                        this project replaces with Ollama embeddings and
+#                        already stubs in src/rag/_chromadb_compat.py (a fix
+#                        for a Windows DLL conflict that turns out to make the
+#                        real package unnecessary everywhere).
+# Removing both is verified, not assumed: the retrieval path was exercised
+# without them (chromadb import, upsert, query, and graceful degradation) and
+# the compose smoke test re-checks it inside the built image on every run.
+#
+# Uninstalled in the SAME layer as the install - a separate RUN would leave the
+# bytes in the earlier layer and shrink nothing.
+RUN pip install --no-cache-dir -r requirements-api.txt \
+    && pip uninstall -y kubernetes onnxruntime
 
 COPY src ./src
+
+# Run as a non-root user. The service reads the mounted lakehouse and writes
+# generated briefings, so it needs no privileges beyond that.
+RUN useradd --create-home --uid 10001 appuser \
+    && mkdir -p /app/data \
+    && chown -R appuser:appuser /app
+USER appuser
+
 EXPOSE 8000
+
+# Uses the API's own /health endpoint, which deliberately has no lakehouse or
+# model dependency - so this reports whether the *service* is up, and doesn't
+# turn a not-yet-populated Delta table into an unhealthy container.
+HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=5 \
+    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=4).status==200 else 1)"
+
 CMD ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8000"]

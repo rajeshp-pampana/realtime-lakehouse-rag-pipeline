@@ -21,11 +21,10 @@ import yfinance as yf
 
 from src import config
 
-# Master portfolio list (unchanged from baseline).
-TICKERS = [
-    "MSFT", "CRWD", "AVGO", "GLE.PA", "NVDA", "AMZN", "AXON", "PANW",
-    "INTC", "NOW", "IREN", "GOOG", "MU", "SOFI", "PLTR", "RDW", "DRAM",
-]
+# Master portfolio list (unchanged from baseline). Defined in src/config.py and
+# re-exported here so existing callers keep working; see the note there on why
+# it moved (the API needs the list without importing yfinance).
+TICKERS = config.TICKERS
 
 RAW_DIR = os.path.join("data", "raw")
 

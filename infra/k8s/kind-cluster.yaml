@@ -1,0 +1,39 @@
+# Local kind cluster for Milestone 5.
+#
+# Single control-plane node: this is a laptop, and a multi-node cluster would
+# buy nothing here except memory pressure. Everything the manifests exercise
+# (Deployments, Services, ConfigMaps, probes, in-cluster DNS) behaves the same.
+#
+# Create with:
+#   kind create cluster --config infra/k8s/kind-cluster.yaml
+#
+# The node image is pinned by digest, not just tag. kind's default image
+# changes with every kind release, so an unpinned cluster silently changes
+# Kubernetes version when the tool is upgraded - the same class of drift that
+# broke the streaming image when python:3.12-slim moved to Debian 13.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: rlrp
+
+nodes:
+  - role: control-plane
+    image: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+
+    # NodePort -> host port, so the services are reachable from Windows exactly
+    # as the compose stack was (localhost:8000 / localhost:8501). Without these
+    # a NodePort is only reachable from inside the kind node's container.
+    extraPortMappings:
+      - containerPort: 30800   # api NodePort
+        hostPort: 8000
+        protocol: TCP
+      - containerPort: 30851   # ui NodePort
+        hostPort: 8501
+        protocol: TCP
+
+    # The lakehouse is read from the host rather than baked into an image or
+    # copied into the cluster: the Delta tables are real pipeline output that
+    # the batch DAG and streaming consumer keep writing to, so the API should
+    # read the same files those produce.
+    extraMounts:
+      - hostPath: /mnt/c/Users/ASUS/realtime-lakehouse-rag-pipeline/data
+        containerPath: /lakehouse

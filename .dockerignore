@@ -1,0 +1,42 @@
+# Keep the build context small and the images reproducible.
+#
+# The compose files build with `context: ..` (the repo root), so without this
+# every build would ship the local Delta tables, the Chroma index, generated
+# briefings, and the virtualenv into the daemon - none of which belong in an
+# image. Runtime data is provided by mounts/volumes instead, so an image never
+# carries a snapshot of someone's local lakehouse.
+
+# --- Local data: mounted at runtime, never baked in ---
+data/
+
+# --- Python / virtualenv ---
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- VCS / CI / editor ---
+.git/
+.github/
+.gitignore
+.vscode/
+.idea/
+
+# --- Secrets and local config (.env.example is the committed template) ---
+.env
+
+# --- Docs and tests: not needed at runtime ---
+docs/METRICS.md
+README.md
+tests/
+
+# --- Spark/Airflow local state ---
+logs/
+spark-warehouse/
+derby.log
+metastore_db/

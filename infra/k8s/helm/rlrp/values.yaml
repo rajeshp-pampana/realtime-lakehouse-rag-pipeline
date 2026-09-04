@@ -1,0 +1,59 @@
+# Defaults target a local kind cluster with images built by
+# `docker compose build` and loaded via `kind load docker-image`.
+
+# Namespace comes from `helm -n <ns>` (.Release.Namespace), not from here -
+# templating it separately lets the chart disagree with the flag you install
+# with. Kept only as the documented default for that flag.
+# namespace: rlrp
+
+# Images are local; there is no registry. pullPolicy MUST stay IfNotPresent or
+# the kubelet tries to pull rlrp-api:local from Docker Hub and lands in
+# ImagePullBackOff.
+image:
+  pullPolicy: IfNotPresent
+
+api:
+  replicaCount: 1
+  image:
+    repository: rlrp-api
+    tag: local
+  service:
+    port: 8000
+    nodePort: 30800
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits:   { cpu: "1",  memory: 768Mi }
+
+ui:
+  replicaCount: 1
+  image:
+    repository: rlrp-ui
+    tag: local
+  service:
+    port: 8501
+    nodePort: 30851
+  resources:
+    requests: { cpu: 100m, memory: 192Mi }
+    limits:   { cpu: "1",  memory: 640Mi }
+
+# The uid baked into both images. Pods must run as this to read the mounted
+# lakehouse.
+securityContext:
+  runAsUser: 10001
+  runAsGroup: 10001
+
+# Host path exposed by the kind node (see infra/k8s/kind-cluster.yaml).
+lakehouse:
+  hostPath: /lakehouse
+
+config:
+  deltaOhlcvRaw: /app/data/delta/ohlcv_raw
+  deltaOhlcvCurated: /app/data/delta/ohlcv_curated
+  deltaTicksRaw: /app/data/delta/ticks_raw
+  vectorstoreDir: /app/data/vectorstore
+  briefingsDir: /app/data/briefings
+  briefingTimeoutSeconds: "900"
+  # Ollama runs on the developer's host, not in the cluster - a 4.7GB model
+  # server would dominate a laptop cluster. Left empty by default, in which
+  # case read endpoints work and POST /briefings returns 502.
+  ollamaHost: ""
