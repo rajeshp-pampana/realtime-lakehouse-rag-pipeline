@@ -21,22 +21,32 @@ def test_rag_modules_import():
     assert hasattr(retriever, "retrieve")
 
 
-def _ollama_reachable() -> bool:
+def _embedding_model_available() -> bool:
+    """True only if Ollama is up AND the embedding model is actually pulled.
+
+    Reachability alone is not enough, and the difference is not academic: a
+    freshly started Ollama whose model store is still downloading answers
+    /api/tags happily, so this test would run and then fail with
+    `model "nomic-embed-text" not found` - a confusing failure where a skip is
+    the correct outcome. Caught while pulling models into the containerised
+    Ollama added in the containerised-briefing work.
+    """
     try:
         import httpx
 
         from src import config
 
-        httpx.get(config.OLLAMA_HOST, timeout=1.0)
-        return True
+        response = httpx.get(f"{config.OLLAMA_HOST}/api/tags", timeout=2.0)
+        names = {m["name"].split(":")[0] for m in response.json().get("models", [])}
+        return config.OLLAMA_EMBED_MODEL.split(":")[0] in names
     except Exception:
         return False
 
 
 pytestmark_ollama = pytest.mark.skipif(
-    not _ollama_reachable(),
-    reason="No reachable Ollama server (needed for real embeddings) - this test needs "
-    "OLLAMA_HOST running with the embedding model pulled; skipped in CI, run locally",
+    not _embedding_model_available(),
+    reason="Needs a reachable Ollama with the embedding model pulled "
+    "(`ollama pull nomic-embed-text`); skipped in CI, run locally",
 )
 
 

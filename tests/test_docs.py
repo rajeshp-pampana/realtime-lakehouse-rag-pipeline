@@ -44,6 +44,10 @@ HEADLINE_FIGURES = [
     "27s",         # compose cold start
     "23 min",      # kind soak duration
     "4.3 min",     # CI wall clock
+    "0.667",       # retrieval precision@1
+    "0.789",       # retrieval MRR
+    "705.7",       # containerised warm briefing
+    "956.2",       # containerised cold briefing
 ]
 
 

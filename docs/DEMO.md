@@ -4,16 +4,38 @@ How to start, stop and present this project. Written for the case where someone
 is watching, so it also covers the things that go wrong on a laptop in front of
 an audience.
 
-There are two ways to run the stack, and they demonstrate different things:
+## Deployment matrix — what works where
 
-| | Native (Windows) | Docker / Kubernetes |
+Every feature now works on every path. What differs is speed and setup cost.
+
+| Feature | Native (Windows) | Docker Compose | Kubernetes (kind) |
+|---|---|---|---|
+| Curated prices, ticks, lakehouse stats | ✅ | ✅ | ✅ |
+| Streamlit console | ✅ | ✅ | ✅ |
+| OpenAPI docs, `/metrics` | ✅ | ✅ | ✅ |
+| **Retrieval-grounded briefings** | ✅ | ✅ `--profile llm` | ✅ `--set ollama.enabled=true` |
+| Kafka → Spark → Delta streaming | ➖ manual | ✅ `--profile streaming` | ➖ not deployed |
+| Prometheus + Grafana | ➖ | ✅ `--profile monitoring` | ➖ not deployed |
+| Airflow | ➖ WSL2 | ✅ `--profile orchestration` | ➖ not deployed |
+| Survives idle | ✅ | Only while a WSL window stays open | Same |
+
+**Measured briefing speed**, because the paths are not equivalent:
+
+| | Native | Containerised |
 |---|---|---|
-| Best for | **Actually using the app**, including briefings | The deployment story |
-| Briefings work? | **Yes** | No — see [Why briefings need the native path](#why-briefings-need-the-native-path) |
-| Survives idle? | Yes | Only while a WSL window stays open |
+| Briefing, warm | **65–93 s** | 705.7 s |
+| Briefing, cold | 480 s | 956.2 s |
+| Retrieval | 4.5 s | **1.2 s (faster)** |
 
-For a live demo, run the **native** path and *talk about* the container/k8s work
-(or bring the compose stack up separately to show Grafana).
+Containerised generation is ~1.6× slower per token because llama3 (6.2 GB
+resident) against WSL2's 8 GB leaves the VM swapping. Retrieval is *faster*
+there, because the embedding model shares an always-on Ollama with a 30-minute
+keep-alive instead of being evicted by llama3 between calls. Full numbers and
+the levers that were tried and did not work are in [METRICS.md](METRICS.md).
+
+**For a live demo, use the native path** — briefings are 8× faster, which is the
+difference between 90 seconds and 12 minutes in front of an audience. Show the
+containerised path for the deployment story.
 
 ---
 
@@ -162,16 +184,28 @@ error that reads like a Docker configuration problem rather than "the distro
 shut down". An interactive `wsl` window is enough to prevent it; so is any
 long-running process inside the distro.
 
-### Why briefings need the native path
+### Briefings in containers
 
-Ollama runs on **Windows**; Docker runs inside **WSL2**. Reaching the Windows
-host from a container needs the host gateway *and* an inbound Windows Firewall
-rule for port 11434, which requires administrator rights. Without it the API
-container cannot reach Ollama and `POST /api/v1/briefings` returns **502**.
+Ollama runs as its own service in the stack, so briefings work here too:
 
-Every other endpoint works in containers - prices, ticks, lakehouse stats,
-metrics - so the container demo is still worth showing. Just generate briefings
-from the native path.
+```bash
+docker compose --profile llm up -d       # + ollama, and pulls the models
+```
+
+The first start downloads ~4.7GB into a named volume; later starts reuse it.
+The API reaches Ollama by service name over the compose network.
+
+This replaced an arrangement that could never have worked: Ollama ran on
+**Windows** while the containers run in **WSL2**, and reaching the Windows host
+needs an inbound firewall rule on 11434 that requires administrator rights.
+`POST /api/v1/briefings` simply returned 502.
+
+**It requires `memory=8GB` in `.wslconfig`.** llama3 is 6.2GB resident; WSL2's
+default allocation is 50% of host RAM (5.86GB here), which is not enough and
+would page rather than fail cleanly. The repo's `.wslconfig` sets this.
+
+**Expect ~12 minutes per briefing on this path**, versus ~90 seconds native —
+see the deployment matrix above.
 
 ---
 
@@ -181,7 +215,7 @@ from the native path.
 |---|---|---|
 | Links dead after a few minutes (Docker path) | WSL tore down its services | Keep a `wsl` window open, then `docker compose up -d` again |
 | `ERR_CONNECTION_REFUSED` on 8501 | Nothing is listening — the process stopped | Restart the UI (native) or the stack (Docker) |
-| Briefing returns 502 | Ollama unreachable | Native path, and confirm `curl http://localhost:11434/api/tags` |
-| Briefing takes ~7 minutes | Cold model load | Warm it first (see above) |
+| Briefing returns 502 | Ollama not running | Native: `ollama serve`. Compose: `docker compose --profile llm up -d`. Check `curl http://localhost:11434/api/tags` |
+| Briefing takes 7-16 minutes | Cold model load, or the containerised path | Warm it first; prefer the native path for demos |
 | Prices endpoint returns 503 | A Delta table is missing | `python -m src.ingestion.fetch_market_data` |
 | Port already in use | The other path is still running | `docker compose down`, or stop the native processes |

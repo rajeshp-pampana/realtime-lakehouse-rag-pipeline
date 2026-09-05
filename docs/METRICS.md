@@ -51,6 +51,15 @@ placeholder in the CV Projects section.
 | **Grafana end to end** | **Datasource + dashboard auto-provisioned; Grafana queried Prometheus and received `218`** | 2026-09-04 | `POST /api/ds/query` through Grafana's own provisioned datasource (uid `PBFA97CFB590B2093`), dashboard `Pipeline Health` (uid `rlrp-pipeline-health`) | M6 |
 | **Monitoring stack memory** | **~90 MB total**: Grafana 55.4 MB, Prometheus 24.7 MB, Pushgateway 9.4 MB | 2026-09-04 | `docker stats --no-stream`. Cheap enough to leave running alongside the pipeline | M6 |
 | **API latency, containerized over a 9p bind mount** | `/health` **p50 1.25ms / p95 2.4ms**; `/api/v1/prices/{ticker}` **p50 75.9ms / p95 99.1ms**; `/api/v1/lakehouse/stats` **p50 492ms / p95 948ms** | 2026-09-04 | Prometheus `histogram_quantile` over the live histogram, 218 real requests. **Notably slower than the M4 figures** (24.26ms and 86.83ms p50) measured on Windows-native uvicorn - see the note below on why | M6 |
+| **Retrieval quality, precision@1** | **0.667** (10/15 questions ranked the labelled document first) | 2026-09-05 | `python scripts/eval_retrieval.py` against the 15-question labelled set in `docs/eval/retrieval_eval.yaml`. Index built fresh from the 3 committed context documents only, so the figure is reproducible from a clean checkout | M8 |
+| **Retrieval quality, MRR** | **0.789** across 15 questions | 2026-09-05 | Same run. Mean reciprocal rank of the labelled document | M8 |
+| Retrieval quality, hit rate@3 | 1.000 (15/15) - **not an informative number** | 2026-09-05 | Same run. With a 3-document corpus, "was the right document in the top 3?" is answered trivially yes. Recorded only so nobody quotes it as evidence of quality; precision@1 and MRR are the figures that carry information | M8 |
+| **Retrieval query latency, warm embedding** | **0.172s mean** across 15 queries | 2026-09-05 | Same run, measured per query. Far below the 4.49-5.47s recorded in M3 because that figure includes the embedding model cold load; this is warm-path only. Both are real, of different things | M8 |
+| **Containerised briefing, end to end** | **HTTP 200 in 956.20s** (retrieval 20.76s + generation 926.87s) | 2026-09-05 | `POST /api/v1/briefings/MSFT` against the compose stack with the `llm` profile up. The API container reached the Ollama container by service name over the compose network - the path that previously could not work at all, because Ollama ran on Windows while the containers run in WSL2 and the firewall blocks that hop. Cited 4 sources: 2 prior briefings + `tickers.md` + `schema_notes.md`. Cold model load included | M8 |
+| **Containerised briefing, warm** (model already resident) | **708.62s** (retrieval 1.16s + generation 705.72s) | 2026-09-05 | Second `POST /api/v1/briefings` with `ollama ps` confirming the model resident. Retrieval is *faster* than the native 4.5s figure; generation is ~7.6x the native warm 92.57s. Not cold-start - see the note below on why | M8 |
+| **Containerised token throughput** | **1.54-1.72 tok/s generation** (2 samples), 2.94 tok/s prompt eval | 2026-09-05 | Raw `ollama.chat` timing fields from inside the container. Against the native warm figure of 2.73 tok/s generation / 3.26 tok/s prompt eval: generation is ~1.6x slower, prompt eval barely moves | M8 |
+| **Containerised llama3 resident memory** | **6.18 GB** (llama3 6.2 GB + nomic-embed-text 370 MB reported by `ollama ps`) | 2026-09-05 | `docker stats` on `rlrp-ollama` while generating. Higher than the 5.0-5.6 GB estimated when sizing this: with the rest of the stack (~570 MB) the total is ~6.75 GB, which does not fit WSL2's default 5.86 GB allocation. This is why `.wslconfig` now sets `memory=8GB` - the estimate would have been optimistic enough to fail | M8 |
+| Runtime memory, stack with containerised LLM | ~6.75 GB total: ollama 6.18 GB, Kafka 391 MB, API 131 MB, UI 47 MB | 2026-09-05 | `docker stats --no-stream` with the `llm` profile up and a briefing in flight, against WSL2's 7.76 GiB | M8 |
 | **CI pipeline duration (full: lint/test + 3 image builds + compose e2e + kind)** | **4.3 min wall clock**, 9.8 runner-minutes across 6 parallel jobs | 2026-09-04 | GitHub Actions run 33900808032, job start/complete timestamps. Breakdown: kind smoke 190s, compose e2e 156s, lint+test 67s, image builds 50-67s each (with `type=gha` layer cache). Materially cheaper than the 10-20 min estimated before measuring, because the heavy jobs run in parallel once `lint-and-test` passes | M6 |
 
 ## Milestone 3 "Done when" proof: a briefing citing retrieved context
@@ -271,6 +280,117 @@ summary is that the API is fast when it reads local disk and noticeably slower
 when the lakehouse arrives over a cross-OS mount, and that the fix for both is
 the same one already recorded: push the predicate into the Parquet scan so the
 reader touches fewer files.
+
+## Containerised briefings: they work, and they are slower
+
+Closing the containerised-briefing gap made the RAG path work under compose and
+Kubernetes rather than only on the developer's machine. It also produced a
+slower briefing, and the reason is worth stating rather than hiding.
+
+**What changed.** Ollama previously ran on Windows while the containers run in
+WSL2. Reaching it needed the host gateway plus an inbound Windows Firewall rule
+on 11434 that requires administrator rights, so `POST /briefings` simply
+returned 502 in every containerised deployment. Ollama now runs as its own
+service in the compose stack (`--profile llm`) and as an optional Deployment in
+the Helm chart, and the API reaches it by service name - the same substitution
+the UI already makes for the API.
+
+**It works.** `POST /api/v1/briefings/MSFT` returned 200 from the compose stack,
+citing 4 retrieved sources, with the API container reaching the Ollama container
+over the compose network.
+
+**It is slower, and not because of cold start.**
+
+| | Native (host Ollama) | Containerised |
+|---|---|---|
+| Briefing, cold | 480.28s | 956.20s |
+| Briefing, warm | 65.64-92.57s | 705.72s |
+| Generation throughput | 2.73 tok/s | 1.54-1.72 tok/s |
+| Prompt eval throughput | 3.26 tok/s | 2.94 tok/s |
+| Retrieval | 4.49-5.47s | **1.16s (faster)** |
+
+The warm run had `ollama ps` confirming the model resident, so this is a real
+per-token penalty of roughly 1.6x, not a load artefact.
+
+**Why: memory pressure inside the VM.** llama3 is 6.2GB resident and WSL2 is
+allocated 8GB, leaving ~1.1GB available with the stack up - and 793-841MB of
+swap in use. Generation is memory-bandwidth-bound, which is why it takes the
+hit while prompt eval (compute-bound) barely moves.
+
+**A lever that was tested and did not work.** Stopping Kafka and the UI freed
+318MB, but generation did not improve (1.54 tok/s versus 1.72 tok/s - if
+anything slightly worse, within single-sample noise). So "run a lean profile
+when generating" is *not* the fix, and is deliberately not recommended
+anywhere. The constraint is the model against the VM's total memory, not the
+other containers.
+
+**Untested option, flagged as untested:** raising WSL2 beyond 8GB would reduce
+the swapping, but on a 12GB host that squeezes Windows itself, so it was not
+done unilaterally.
+
+**Retrieval got faster**, from 4.49-5.47s to 1.16s, because the embedding model
+now lives in the same always-on Ollama instance with a 30-minute keep-alive
+instead of being evicted by llama3 between calls - the "model thrashing"
+recorded under M3.
+
+## Retrieval quality: what the 0.667 actually says
+
+`docs/METRICS.md` recorded how *fast* retrieval was long before it recorded
+whether it returned the *right* thing. This closes that gap, and the number is
+mid-range rather than flattering, which makes it worth reading carefully.
+
+**Setup.** 15 labelled questions (`docs/eval/retrieval_eval.yaml`), 5 per
+document, against the 3 committed context documents. Questions are deliberately
+phrased so they do not quote their target document - a query copied out of the
+file it is meant to retrieve would score highly on overlap alone and measure
+nothing. A test enforces that (no 5-word run from a question may appear verbatim
+in its own label).
+
+**Result.** precision@1 = 0.667 (10/15), MRR = 0.789.
+
+**hit rate@3 = 1.000 is not a quality signal.** The corpus is 3 documents, so
+"was the right one in the top 3?" is answered trivially yes. It is recorded only
+so that it cannot be quoted as if it meant something. precision@1 and MRR are
+the informative figures, and any quotation of them should carry the corpus size.
+
+**Where the misses are, and why.** 4 of the 5 misses were `tickers.md`
+questions. That is not random: `src/rag/index_builder.py` embeds **one vector
+per document with no chunking**, and `tickers.md` is a list of 17 different
+companies. A single embedding of that list averages across all of them, so it
+matches no individual-company query strongly - "which holding is the clearest
+proxy for AI infrastructure spending?" lost to `methodology.md`.
+
+**The diagnosis was tested, not assumed.** Re-running the same 15 questions
+against a corpus where only `tickers.md` was split into one chunk per company
+(19 documents total, other docs untouched):
+
+| | Whole-document (shipped) | tickers.md chunked per company |
+|---|---|---|
+| precision@1 | 0.667 | **0.800** |
+| MRR | 0.789 | 0.800 |
+| Ticker questions ranked 1st | 1/5 | **5/5** |
+
+All five ticker questions go from miss to rank-1, which confirms the cause.
+
+**But chunking is not a free win, which is why it is not shipped here.** With
+19 documents instead of 3, three *non*-ticker questions fell out of the top 3
+entirely, twice losing first place to a small ticker chunk. Splitting one
+document changed the retrieval dynamics for every other document. Doing this
+properly means chunking the whole corpus consistently and re-tuning `RAG_TOP_K`,
+then re-measuring - not splitting the one file that showed up in the misses.
+Recorded as a measured, reproducible starting point for that work.
+
+**Reproducibility was checked, not assumed.** Two independent runs of
+`scripts/eval_retrieval.py` returned identical figures - precision@1 0.6667,
+MRR 0.7889 - and the same five failing question ids. The eval builds its index
+from the committed context documents only; scoring against the live index would
+have included whatever generated briefings happened to be present and made the
+number unrepeatable.
+
+**On the latency difference.** The mean query latency here is 0.172s, against
+the 4.49-5.47s recorded under M3. Both are real and they measure different
+things: the M3 figure is a cold path that includes loading the embedding model,
+this one is warm-path only, with the model already resident.
 
 ## Machine baseline (for context on all timings)
 

@@ -1,0 +1,125 @@
+{{- if .Values.ollama.enabled }}
+{{- if .Values.ollama.persistence.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ .Release.Name }}-ollama-models
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "rlrp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ollama
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: {{ .Values.ollama.persistence.size }}
+  {{- if .Values.ollama.persistence.storageClass }}
+  storageClassName: {{ .Values.ollama.persistence.storageClass | quote }}
+  {{- end }}
+---
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-ollama
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "rlrp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ollama
+spec:
+  replicas: 1
+  # A single model store on one PVC (ReadWriteOnce) - two pods cannot mount it,
+  # and a rolling update would deadlock waiting for the old pod to release it.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "rlrp.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: ollama
+  template:
+    metadata:
+      labels:
+        {{- include "rlrp.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: ollama
+    spec:
+      initContainers:
+        # Pull the models before the server accepts traffic, so the API never
+        # sees a running Ollama that has no model to serve. `ollama pull` is
+        # idempotent, so this is cheap on every restart after the first.
+        - name: pull-models
+          image: "{{ .Values.ollama.image.repository }}:{{ .Values.ollama.image.tag }}"
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              /bin/ollama serve &
+              server=$!
+              until /bin/ollama list >/dev/null 2>&1; do sleep 2; done
+              {{- range .Values.ollama.models }}
+              echo "pulling {{ . }}"
+              /bin/ollama pull {{ . }}
+              {{- end }}
+              kill $server
+              echo "models ready"
+          volumeMounts:
+            - name: models
+              mountPath: /root/.ollama
+      containers:
+        - name: ollama
+          image: "{{ .Values.ollama.image.repository }}:{{ .Values.ollama.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.ollama.service.port }}
+          env:
+            - name: OLLAMA_KEEP_ALIVE
+              value: {{ .Values.ollama.keepAlive | quote }}
+            - name: OLLAMA_HOST
+              value: "0.0.0.0:{{ .Values.ollama.service.port }}"
+          volumeMounts:
+            - name: models
+              mountPath: /root/.ollama
+          readinessProbe:
+            # /api/tags answers as soon as the server is up and can read its
+            # model store; it does not load a model, so it stays fast.
+            httpGet: { path: /api/tags, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 12
+          livenessProbe:
+            httpGet: { path: /api/tags, port: http }
+            # Generous: a cold model load pins the CPU for minutes on modest
+            # hardware, and killing the pod mid-load would loop forever.
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.ollama.resources | nindent 12 }}
+      volumes:
+        - name: models
+          {{- if .Values.ollama.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ .Release.Name }}-ollama-models
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-ollama
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "rlrp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ollama
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "rlrp.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: ollama
+  ports:
+    - name: http
+      port: {{ .Values.ollama.service.port }}
+      targetPort: http
+{{- end }}

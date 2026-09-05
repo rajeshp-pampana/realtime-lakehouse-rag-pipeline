@@ -58,6 +58,18 @@ Then pick from the following, depending on the role's emphasis.
   generated briefings are re-indexed.**
   *Measured:* four real retrieval samples inside real generation calls.
 
+- **Built a labelled evaluation set for the retrieval step and measured
+  precision@1 = 0.667 and MRR = 0.789 over 15 questions, reproducibly.**
+  *Measured:* `scripts/eval_retrieval.py`, index rebuilt from committed
+  documents so two independent runs return identical figures. The misses were
+  diagnosed to whole-document embedding of a list-shaped file, and the
+  diagnosis was confirmed by a chunking experiment (precision@1 0.667 → 0.800).
+
+- **Made the containerised and Kubernetes paths run the LLM too**, so briefings
+  are not limited to a developer's machine — and measured the cost: ~1.6×
+  slower per token, because the model is 6.2GB against an 8GB VM.
+  *Measured:* real briefings from the compose stack, plus token throughput.
+
 ### Platform / DevOps
 
 - **Containerised five services and deployed to Kubernetes via a Helm chart,
@@ -96,12 +108,14 @@ Then pick from the following, depending on the role's emphasis.
 | p50 2.82s write latency | M2 write latency | Max 15.49s in the first batch reflects query cold start |
 | p50 24ms / p95 27ms API | M4 prices latency | Native uvicorn; 3–6× slower containerised over a 9p mount |
 | ~4.5s retrieval | M3 retrieval latency | One 10.6s outlier when the LLM evicted the embedding model |
+| precision@1 0.667, MRR 0.789 | M8 retrieval quality | 3-document corpus, so hit@3 is trivially 1.0 and means nothing; quote precision@1 with the corpus size |
+| 1.6x slower containerised generation | M8 token throughput | Two samples; the cause is VM memory pressure, and stopping other containers did not help |
 | 65–93s briefing (warm) | M3 briefing warm | Memory-bound on 8 GB; ~480s cold. Not a model-quality claim |
 | 918 rows in 76s containerised | M5 containerized streaming | Baseline read from the live API first, so these are genuinely new rows |
 | 0 pod restarts, 23 min soak | M5 soak test | Needed a WSL2 keep-alive; the cluster is not otherwise stable on this host |
 | 980 MB API image | M5 image size | Still large — dominated by pandas/pyarrow, not by anything removable |
 | 4.3 min CI | M6 CI duration | Wall clock across parallel jobs; 9.8 runner-minutes total |
-| 91 tests | test suite | 3 skip locally (need Spark/Ollama); all run in CI |
+| 109 tests | test suite | 3 skip locally (need Spark/Ollama); all run in CI |
 | ~90 MB monitoring stack | M6 monitoring memory | Idle footprint with a small time series volume |
 
 ---

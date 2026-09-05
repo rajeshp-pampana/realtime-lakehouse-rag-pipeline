@@ -1,0 +1,93 @@
+# Labelled evaluation set for the RAG retrieval step.
+#
+# Purpose: docs/METRICS.md records how *fast* retrieval is (~4.5s) but said
+# nothing about whether it returns the *right* thing. This set makes that
+# measurable and reproducible.
+#
+# Design notes that matter for reading the resulting numbers honestly:
+#
+#  1. src/rag/index_builder.py embeds ONE VECTOR PER DOCUMENT - there is no
+#     chunking. So the unit of retrieval is a whole file, and the correct
+#     label is a filename, not a passage.
+#
+#  2. The committed corpus is small (3 context documents). With the pipeline's
+#     default RAG_TOP_K=4, "was the right document in the top 4?" is answered
+#     trivially yes and measures nothing. The informative metrics here are
+#     precision@1 (did the single best-ranked document turn out to be the right
+#     one?) and MRR. hit@3 is reported too, but read it with the corpus size in
+#     mind.
+#
+#  3. Questions are phrased the way someone would actually ask them, and
+#     deliberately avoid quoting the source document's exact wording - a query
+#     copied verbatim out of the target file would inflate the score without
+#     telling us anything about retrieval quality.
+
+corpus:
+  # Evaluated against the committed context documents only, so the number is
+  # reproducible from a clean checkout. Generated briefings live in the live
+  # index too, but they vary run to run and would make the score unrepeatable.
+  context_dir: docs/context
+
+questions:
+  # --- schema_notes.md: lakehouse structure and indicator meaning ---
+  - id: schema-columns-curated
+    question: Which fields hold the moving averages and the rolling volatility?
+    expected: schema_notes.md
+
+  - id: schema-null-first-row
+    question: Why is the day-over-day change empty for the earliest row of a stock?
+    expected: schema_notes.md
+
+  - id: schema-separate-tables
+    question: Why are intraday events kept apart from the daily bar table?
+    expected: schema_notes.md
+
+  - id: schema-bullish-setup
+    question: What arrangement of the two moving averages is read as bullish?
+    expected: schema_notes.md
+
+  - id: schema-quiet-then-move
+    question: What does a falling noise measure alongside a flat trend line suggest?
+    expected: schema_notes.md
+
+  # --- tickers.md: company and sector context ---
+  - id: ticker-ai-accelerators
+    question: Which holding is the clearest proxy for AI infrastructure spending?
+    expected: tickers.md
+
+  - id: ticker-european-bank
+    question: Which position is a European lender exposed to eurozone rates?
+    expected: tickers.md
+
+  - id: ticker-memory-cycle
+    question: Which names track the memory pricing cycle?
+    expected: tickers.md
+
+  - id: ticker-security-spend
+    question: Which holdings depend on corporate security budgets?
+    expected: tickers.md
+
+  - id: ticker-crypto-power
+    question: Which holding's economics depend on electricity costs and crypto prices?
+    expected: tickers.md
+
+  # --- methodology.md: provenance, governance, limitations ---
+  - id: method-simulated-feed
+    question: Is the intraday price feed genuine exchange data or generated?
+    expected: methodology.md
+
+  - id: method-secrets
+    question: Where should credentials come from outside of local development?
+    expected: methodology.md
+
+  - id: method-history-window
+    question: How far back does the price history actually reach?
+    expected: methodology.md
+
+  - id: method-not-advice
+    question: Can the model's written output be treated as verified research?
+    expected: methodology.md
+
+  - id: method-licensing
+    question: What legal question would need answering before any commercial use?
+    expected: methodology.md

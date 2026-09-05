@@ -46,6 +46,34 @@ securityContext:
 lakehouse:
   hostPath: /lakehouse
 
+# Local LLM, so the retrieval-grounded briefing works in-cluster and not only
+# on a developer's machine. Disabled by default: the model is ~4.7GB to pull
+# and needs ~5.0-5.6GB resident, which is more than a laptop kind cluster
+# usually has spare. Enable with --set ollama.enabled=true.
+ollama:
+  enabled: false
+  image:
+    repository: ollama/ollama
+    tag: "0.5.4"
+  service:
+    port: 11434
+  # Models are pulled by an init container on first start.
+  models:
+    - llama3
+    - nomic-embed-text
+  # Keep a model resident longer than the 5m default so a second briefing is
+  # warm (~66-93s) rather than a cold reload (~480s).
+  keepAlive: "30m"
+  persistence:
+    # A PVC so the ~4.7GB pull survives pod restarts. kind ships a default
+    # StorageClass; set storageClass explicitly on a cluster that does not.
+    enabled: true
+    size: 20Gi
+    storageClass: ""
+  resources:
+    requests: { cpu: 500m, memory: 2Gi }
+    limits:   { cpu: "4",  memory: 7Gi }
+
 config:
   deltaOhlcvRaw: /app/data/delta/ohlcv_raw
   deltaOhlcvCurated: /app/data/delta/ohlcv_curated
@@ -53,7 +81,8 @@ config:
   vectorstoreDir: /app/data/vectorstore
   briefingsDir: /app/data/briefings
   briefingTimeoutSeconds: "900"
-  # Ollama runs on the developer's host, not in the cluster - a 4.7GB model
-  # server would dominate a laptop cluster. Left empty by default, in which
-  # case read endpoints work and POST /briefings returns 502.
+  # Left empty: when ollama.enabled is true the chart points the API at the
+  # in-cluster Service automatically. Set this only to reach an Ollama that
+  # lives outside the cluster. With neither, read endpoints all work and
+  # POST /briefings returns 502.
   ollamaHost: ""

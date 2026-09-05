@@ -118,6 +118,8 @@ measured **3–6× slower** when containerised over a cross-OS bind mount — se
 | Index build (5 docs) | **12.14s**, 768-dim embeddings |
 | Briefing generation, warm | **65.6s / 92.6s** |
 | Briefing generation, cold (model load) | **480.3s** |
+| **Retrieval precision@1** | **0.667** (10/15 labelled questions) |
+| **Retrieval MRR** | **0.789** |
 | Local `llama3` throughput | **2.73 tok/s** generation |
 
 Generation is memory-bound, not pipeline-bound: `llama3` is a 4.7 GB model, while
@@ -134,7 +136,7 @@ retrieval around it costs ~4.5s and the entire Delta read costs ~24 ms.
 | Cluster stability soak | **23 min continuous**, 21 samples, every one healthy |
 | Monitoring stack overhead | **~90 MB** (Grafana 55, Prometheus 25, Pushgateway 9) |
 | Full CI pipeline | **4.3 min** wall clock, 9.8 runner-minutes, 6 parallel jobs |
-| Test suite | **91 tests** (88 passed, 3 skipped locally) |
+| Test suite | **109 tests** (106 passed, 3 skipped locally) |
 
 ---
 
@@ -167,6 +169,7 @@ Add the optional stacks as needed:
 docker compose --profile streaming up             # + tick producer and Spark consumer
 docker compose --profile monitoring up            # + prometheus, grafana, pushgateway
 docker compose --profile orchestration up         # + airflow
+docker compose --profile llm up                   # + ollama, so briefings work
 ```
 
 Services without a `profiles` key start by default. Spark and Airflow are the
@@ -279,6 +282,38 @@ dashboard are auto-provisioned, so the stack is useful the moment it starts.
 Every metric push is best-effort and swallows its own failures. A metrics backend
 being down must not fail an ingestion run or kill a streaming query —
 observability that can take out the pipeline is worse than none.
+
+---
+
+## Deployment matrix
+
+Every feature works on every path; what differs is speed and setup cost.
+
+| Feature | Native | Docker Compose | Kubernetes (kind) |
+|---|---|---|---|
+| Prices, ticks, lakehouse stats | ✅ | ✅ | ✅ |
+| Streamlit console | ✅ | ✅ | ✅ |
+| OpenAPI docs, `/metrics` | ✅ | ✅ | ✅ |
+| **Retrieval-grounded briefings** | ✅ | ✅ `--profile llm` | ✅ `--set ollama.enabled=true` |
+| Kafka → Spark → Delta | manual | ✅ `--profile streaming` | not deployed |
+| Prometheus + Grafana | — | ✅ `--profile monitoring` | not deployed |
+| Airflow | WSL2 | ✅ `--profile orchestration` | not deployed |
+
+Briefings work everywhere now, but not equally fast:
+
+| | Native | Containerised |
+|---|---|---|
+| Briefing, warm | **65–93 s** | 705.7 s |
+| Briefing, cold | 480 s | 956.2 s |
+| Generation throughput | 2.73 tok/s | 1.54–1.72 tok/s |
+| Retrieval | 4.5 s | **1.2 s (faster)** |
+
+Containerised generation is ~1.6× slower per token: llama3 is 6.2 GB resident
+against WSL2's 8 GB, so the VM swaps, and generation is memory-bandwidth-bound.
+Retrieval is *faster* there, because the embedding model shares an always-on
+Ollama with a 30-minute keep-alive rather than being evicted by llama3 between
+calls. Stopping the other containers was tried and did not help — the constraint
+is the model against total VM memory, not the neighbours.
 
 ---
 
@@ -480,10 +515,16 @@ Vector store: Chroma (persistent, `data/vectorstore/`). Embeddings: Ollama's
 `nomic-embed-text` (768-dim), chosen over `sentence-transformers` to keep the
 stack local and avoid pulling ~2 GB of torch.
 
-Ollama is deliberately **not** containerised — a 4.7 GB model server would dwarf
-this stack and is already installed natively. The API reaches it via the host
-gateway, which also needs `OLLAMA_HOST=0.0.0.0` on the host. Without that, every
-read endpoint works and only `POST /briefings` returns 502.
+Ollama also runs as a service in the stack, so briefings work in containers and
+in Kubernetes, not only natively:
+
+```bash
+docker compose --profile llm up -d                          # compose
+helm install rlrp infra/k8s/helm/rlrp --set ollama.enabled=true   # kubernetes
+```
+
+Both are opt-in: the first start pulls ~4.7 GB and llama3 needs 6.2 GB
+resident. See [Deployment matrix](#deployment-matrix) for what that costs.
 </details>
 
 <details>
@@ -551,7 +592,7 @@ pushes burning minutes.
 
 | Job | What it proves |
 |---|---|
-| `lint-and-test` | ruff + the full 91-test suite |
+| `lint-and-test` | ruff + the full 109-test suite |
 | `build-images` (x3) | Each image builds and contains what it should — **and nothing it shouldn't** |
 | `compose-e2e` | Kafka -> producer -> Spark consumer -> Delta, asserting rows that did not exist before, plus `/metrics` exposition |
 | `k8s-smoke` | Helm lint/render, deploy to a real kind cluster, UI->API over cluster DNS, upgrade path |

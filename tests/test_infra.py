@@ -563,3 +563,91 @@ def test_image_requirements_cover_what_the_code_imports():
             f"{req_file} is missing packages its code imports: {missing}. "
             f"The dev venv and CI would pass while the container fails at import."
         )
+
+
+# --- Containerised LLM path -------------------------------------------------
+#
+# Briefings previously worked only on the native Windows path, because Ollama
+# ran on the host while the containers run in WSL2. These guard the wiring that
+# closed that gap.
+
+
+def test_compose_runs_ollama_as_a_service():
+    services = _compose()["services"]
+    assert "ollama" in services, "the compose stack must include an ollama service"
+    assert services["ollama"].get("profiles"), (
+        "ollama should be opt-in: the first start pulls ~4.7GB and the model "
+        "needs ~5GB resident"
+    )
+
+
+def test_api_reaches_ollama_by_service_name_not_the_host():
+    """host.docker.internal cannot work here and silently 502s.
+
+    Ollama ran on Windows while the containers run in WSL2, and Windows
+    Firewall blocks WSL -> host on 11434 without an admin-created rule. The API
+    must therefore talk to the in-stack service.
+    """
+    api_env = _compose()["services"]["api"]["environment"]
+    host = api_env["OLLAMA_HOST"]
+    assert "host.docker.internal" not in host, (
+        "the API must not depend on reaching Ollama on the Windows host"
+    )
+    assert "ollama" in host, f"expected the ollama service name, got {host!r}"
+
+
+def test_compose_pulls_exactly_the_models_the_code_uses():
+    """A model the code requests but nobody pulled fails at request time.
+
+    The failure is a confusing 502/404 from Ollama rather than anything that
+    points at a missing pull, so it is worth pinning here.
+    """
+    from src import config
+
+    init = _compose()["services"]["ollama-init"]
+    command = str(init.get("command", ""))
+    for model in (config.OLLAMA_MODEL, config.OLLAMA_EMBED_MODEL):
+        assert model in command, (
+            f"ollama-init does not pull {model!r}, which src/config.py asks for"
+        )
+
+
+def test_ollama_model_store_is_a_named_volume_not_a_bind_mount():
+    """Model loads over a 9p bind mount would pay the measured 3-6x penalty."""
+    mounts = _compose()["services"]["ollama"]["volumes"]
+    store = [m for m in mounts if "/root/.ollama" in m]
+    assert store, "ollama needs a persistent model store"
+    assert not any(m.startswith((".", "/", "..")) for m in store), (
+        f"the model store should be a named volume, got {store}"
+    )
+
+
+def test_helm_ollama_is_optional_and_off_by_default():
+    """A laptop kind cluster usually cannot spare ~5GB plus a 4.7GB pull."""
+    import yaml
+
+    values = yaml.safe_load((CHART / "values.yaml").read_text(encoding="utf-8"))
+    assert "ollama" in values, "the chart should be able to deploy Ollama"
+    assert values["ollama"]["enabled"] is False, (
+        "ollama must default to off so `helm install` stays laptop-friendly"
+    )
+
+
+def test_helm_chart_pulls_the_models_the_code_uses():
+    import yaml
+
+    from src import config
+
+    values = yaml.safe_load((CHART / "values.yaml").read_text(encoding="utf-8"))
+    models = values["ollama"]["models"]
+    for model in (config.OLLAMA_MODEL, config.OLLAMA_EMBED_MODEL):
+        assert model in models, f"the chart does not pull {model!r}"
+
+
+def test_helm_ollama_deployment_recreates_rather_than_rolls():
+    """One RWO PVC holds the models; a rolling update would deadlock on it."""
+    body = (CHART / "templates" / "ollama.yaml").read_text(encoding="utf-8")
+    assert "type: Recreate" in body, (
+        "a RollingUpdate would wait forever for the old pod to release the "
+        "ReadWriteOnce model volume"
+    )

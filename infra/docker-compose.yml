@@ -23,7 +23,14 @@
 #   docker compose --profile streaming up                    # + producer/consumer
 #   docker compose --profile orchestration up                # + airflow
 #   docker compose --profile monitoring up                   # + prometheus/grafana
+#   docker compose --profile llm up                          # + ollama (briefings)
 #   docker compose --profile streaming --profile monitoring up      # the useful pair
+#
+# The `llm` profile is opt-in rather than default for two honest reasons: the
+# first start pulls a 4.7GB model, and llama3:8b needs ~5.0-5.6GB resident.
+# That fits only because .wslconfig raises WSL2 to 8GB - at the WSL default of
+# 50% of host RAM there was ~4.8GB free once the stack was up, and the model
+# would have paged rather than failed cleanly.
 #
 # The default set (kafka, api, ui) is the product surface plus the broker it
 # will need, and fits comfortably. Spark and Airflow are the memory-hungry
@@ -111,12 +118,14 @@ services:
       VECTORSTORE_DIR: "/app/data/vectorstore"
       BRIEFINGS_DIR: "/app/data/briefings"
       CONTEXT_DOCS_DIR: "/app/docs/context"
-      # Ollama runs on the host, not in compose - it is a 4.7GB model server
-      # that would dwarf this stack, and it is already installed natively.
-      # Reaching it from a container needs the host gateway AND ollama bound
-      # beyond loopback (OLLAMA_HOST=0.0.0.0 on the host). Without that, the
-      # read endpoints all work and only POST /briefings returns 502.
-      OLLAMA_HOST: "http://host.docker.internal:11434"
+      # Ollama runs as its own service in this stack (profile: llm), so the API
+      # reaches it over the compose network by service name. This replaces the
+      # earlier host.docker.internal arrangement, which could not work here:
+      # Ollama ran on Windows while the containers run in WSL2, and Windows
+      # Firewall blocks WSL -> host on 11434 without an admin-created rule.
+      # If the llm profile is not up, this name does not resolve and
+      # POST /briefings returns 502 - every read endpoint still works.
+      OLLAMA_HOST: "http://ollama:11434"
       # The API is scraped at /metrics rather than pushing, but batch tasks run
       # in other containers with the same image family and do push.
       PUSHGATEWAY_URL: "pushgateway:9091"
@@ -187,6 +196,47 @@ services:
       retries: 5
     profiles: ["orchestration"]
 
+  # --- Local LLM (containerised briefing path) ------------------------------
+  ollama:
+    image: ollama/ollama:0.5.4
+    container_name: rlrp-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      # Named volume, not a bind mount from /mnt/c: the model is read at load
+      # time and this project has already measured cross-OS 9p mounts as 3-6x
+      # slower, which would land straight on cold-start latency.
+      - ollama-models:/root/.ollama
+    environment:
+      # Keep the model resident longer than the default 5m so a demo's second
+      # briefing is a warm one (~66-93s) rather than a cold reload (~480s).
+      OLLAMA_KEEP_ALIVE: "30m"
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+    profiles: ["llm"]
+
+  # One-shot: make sure the models the pipeline needs are present. `ollama pull`
+  # is idempotent and returns immediately when a model is already in the volume,
+  # so this is cheap on every start after the first.
+  ollama-init:
+    image: ollama/ollama:0.5.4
+    container_name: rlrp-ollama-init
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: "http://ollama:11434"
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      "ollama pull llama3 && ollama pull nomic-embed-text && echo 'models ready'"
+    restart: "no"
+    profiles: ["llm"]
+
   # --- Observability (Milestone 6) -----------------------------------------
   prometheus:
     image: prom/prometheus:v3.1.0
@@ -236,6 +286,9 @@ services:
 
 volumes:
   airflow-state:
+  # Ollama's model store. A named volume on ext4 rather than a bind mount, so
+  # model loads are not paying the 9p penalty.
+  ollama-models:
   prometheus-data:
   grafana-data:
   # Spark Structured Streaming checkpoints. Deliberately a named volume rather

@@ -12,7 +12,12 @@ data:
   VECTORSTORE_DIR: {{ .Values.config.vectorstoreDir | quote }}
   BRIEFINGS_DIR: {{ .Values.config.briefingsDir | quote }}
   API_BRIEFING_TIMEOUT_SECONDS: {{ .Values.config.briefingTimeoutSeconds | quote }}
-  {{- if .Values.config.ollamaHost }}
+  {{- if .Values.ollama.enabled }}
+  # Ollama runs in-cluster, so the API reaches it by Service name - the same
+  # substitution the UI makes for the API. An explicit config.ollamaHost still
+  # wins, for pointing at an Ollama outside the cluster.
+  OLLAMA_HOST: {{ .Values.config.ollamaHost | default (printf "http://%s-ollama:%v" .Release.Name .Values.ollama.service.port) | quote }}
+  {{- else if .Values.config.ollamaHost }}
   OLLAMA_HOST: {{ .Values.config.ollamaHost | quote }}
   {{- end }}
   # In-cluster DNS. The UI only ever knows the API by its Service name, which
