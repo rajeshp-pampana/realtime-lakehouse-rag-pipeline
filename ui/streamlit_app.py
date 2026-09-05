@@ -45,6 +45,24 @@ from ui.api_client import (  # noqa: E402
     get_tickers,
 )
 
+
+def _escape_markdown_math(text: str) -> str:
+    """Stop Streamlit rendering currency amounts as LaTeX.
+
+    Streamlit renders markdown, and markdown treats ``$...$`` as inline maths.
+    A briefing that mentions two prices - "around the $510 level ... the $500
+    mark" - has its entire middle swallowed into a formula: italicised, with
+    every space stripped. It looks like the model emitted mangled text when in
+    fact the text was fine and the renderer mangled it.
+
+    Escaping the dollar signs is the whole fix. Applied at the point of display
+    rather than in the generator, because the raw text is correct and is also
+    written to data/briefings/ and re-indexed for retrieval - it should stay
+    unescaped there.
+    """
+    return text.replace("$", r"\$")
+
+
 st.set_page_config(page_title="Institutional Portfolio Dashboard", layout="wide")
 st.title("INSTITUTIONAL PORTFOLIO DASHBOARD")
 st.markdown(
@@ -220,7 +238,7 @@ if st.button(f"Generate Briefing for {selected_ticker}"):
     with st.spinner("Calling the API (retrieval + local inference)..."):
         try:
             result = create_briefing(selected_ticker, bars=5)
-            st.write(result["text"])
+            st.write(_escape_markdown_math(result["text"]))
             if result["retrieved_sources"]:
                 st.caption(f"Grounded in: {', '.join(result['retrieved_sources'])}")
             else:

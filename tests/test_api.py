@@ -12,6 +12,7 @@ handling is asserted here; the generation path itself is covered by
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pandas as pd
@@ -350,3 +351,59 @@ def test_lakehouse_stats_survives_an_unusable_table_path(tmp_path, monkeypatch):
     tables = {t["name"]: t for t in response.json()["tables"]}
     assert tables["ohlcv_raw"]["available"] is False
     assert tables["ohlcv_raw"]["detail"]
+
+
+def test_briefing_text_is_escaped_before_streamlit_renders_it():
+    """Currency amounts must not be rendered as LaTeX.
+
+    Streamlit renders markdown, and markdown treats `$...$` as inline maths. A
+    briefing mentioning two prices ("around the $510 level ... the $500 mark")
+    had everything between them swallowed into a formula - italicised, spaces
+    stripped. It reads as though the model produced mangled text, when the text
+    was correct and the renderer mangled it.
+
+    Checked here rather than by eye because the symptom points at the wrong
+    component entirely.
+    """
+    import ast
+
+    source = UI_APP.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    # The helper must exist...
+    helpers = [
+        node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+    ]
+    assert "_escape_markdown_math" in helpers, (
+        "the UI must escape $ before writing LLM text, or prices render as LaTeX"
+    )
+
+    # ...and the briefing text must actually go through it.
+    assert "_escape_markdown_math(result[\"text\"])" in source, (
+        "briefing text must be passed through _escape_markdown_math before st.write"
+    )
+    assert 'st.write(result["text"])' not in source, (
+        "raw briefing text is written unescaped somewhere - $ will render as maths"
+    )
+
+
+def test_escape_helper_neutralises_dollar_pairs():
+    """The escape itself, exercised directly on the text that broke."""
+    import ast
+
+    source = UI_APP.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    func = next(
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "_escape_markdown_math"
+    )
+    namespace: dict = {}
+    exec(compile(ast.Module(body=[func], type_ignores=[]), "<ui>", "exec"), namespace)
+    escape = namespace["_escape_markdown_math"]
+
+    broke_before = "hovering around the $510 level. The 20-day SMA ... the $500 mark."
+    escaped = escape(broke_before)
+
+    assert "\\$510" in escaped and "\\$500" in escaped
+    # No unescaped $ survives, so no pair can open a maths span.
+    assert not re.search(r"(?<!\\)\$", escaped), "an unescaped $ would still start LaTeX"
