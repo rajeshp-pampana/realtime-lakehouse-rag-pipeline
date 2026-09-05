@@ -29,7 +29,7 @@ corpus:
   context_dir: docs/context
 
 questions:
-  # --- schema_notes.md: lakehouse structure and indicator meaning ---
+  # --- schema_notes.md: lakehouse structure and indicator meaning (12) ---
   - id: schema-columns-curated
     question: Which fields hold the moving averages and the rolling volatility?
     expected: schema_notes.md
@@ -50,7 +50,35 @@ questions:
     question: What does a falling noise measure alongside a flat trend line suggest?
     expected: schema_notes.md
 
-  # --- tickers.md: company and sector context ---
+  - id: schema-bronze-grain
+    question: How many entries does the untransformed daily table hold per stock each session?
+    expected: schema_notes.md
+
+  - id: schema-overwrite-vs-append
+    question: Which table is replaced wholesale each run rather than added to?
+    expected: schema_notes.md
+
+  - id: schema-tick-columns
+    question: What fields describe a single simulated trade event?
+    expected: schema_notes.md
+
+  - id: schema-two-timestamps
+    question: Why does a tick carry two different time values?
+    expected: schema_notes.md
+
+  - id: schema-chop-signal
+    question: What return pattern indicates a stock is going sideways rather than trending?
+    expected: schema_notes.md
+
+  - id: schema-ingest-stamp
+    question: Which column records when a row was pulled into storage?
+    expected: schema_notes.md
+
+  - id: schema-volatility-window
+    question: Over how many sessions is the return dispersion calculated?
+    expected: schema_notes.md
+
+  # --- tickers.md: company and sector context (12) ---
   - id: ticker-ai-accelerators
     question: Which holding is the clearest proxy for AI infrastructure spending?
     expected: tickers.md
@@ -71,7 +99,35 @@ questions:
     question: Which holding's economics depend on electricity costs and crypto prices?
     expected: tickers.md
 
-  # --- methodology.md: provenance, governance, limitations ---
+  - id: ticker-cloud-retail
+    question: Which company combines online retail with a large cloud division?
+    expected: tickers.md
+
+  - id: ticker-turnaround-chips
+    question: Which chipmaker is described as attempting a turnaround?
+    expected: tickers.md
+
+  - id: ticker-law-enforcement
+    question: Which position sells equipment to police forces?
+    expected: tickers.md
+
+  - id: ticker-gov-analytics
+    question: Which company sells analytics software to government agencies?
+    expected: tickers.md
+
+  - id: ticker-space
+    question: Which small-cap builds hardware for orbital missions?
+    expected: tickers.md
+
+  - id: ticker-consumer-lending
+    question: Which holding is exposed to household borrowing quality?
+    expected: tickers.md
+
+  - id: ticker-workflow-saas
+    question: Which position sells enterprise workflow automation?
+    expected: tickers.md
+
+  # --- methodology.md: provenance, governance, limitations (12) ---
   - id: method-simulated-feed
     question: Is the intraday price feed genuine exchange data or generated?
     expected: methodology.md
@@ -90,4 +146,32 @@ questions:
 
   - id: method-licensing
     question: What legal question would need answering before any commercial use?
+    expected: methodology.md
+
+  - id: method-daily-bars-real
+    question: Which part of the stored data comes from an actual external provider?
+    expected: methodology.md
+
+  - id: method-tick-realism
+    question: What aspects of genuine trading activity does the synthetic feed omit?
+    expected: methodology.md
+
+  - id: method-pii
+    question: What privacy risk would arise if analyst notes were indexed?
+    expected: methodology.md
+
+  - id: method-vector-access
+    question: What access controls would the embedding store need in production?
+    expected: methodology.md
+
+  - id: method-tick-magnitude
+    question: How large is each artificial price movement?
+    expected: methodology.md
+
+  - id: method-overclaiming
+    question: What should a write-up avoid asserting about longer-term direction?
+    expected: methodology.md
+
+  - id: method-seed-source
+    question: What value does the synthetic generator start each walk from?
     expected: methodology.md

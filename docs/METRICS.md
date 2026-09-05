@@ -51,12 +51,14 @@ placeholder in the CV Projects section.
 | **Grafana end to end** | **Datasource + dashboard auto-provisioned; Grafana queried Prometheus and received `218`** | 2026-09-04 | `POST /api/ds/query` through Grafana's own provisioned datasource (uid `PBFA97CFB590B2093`), dashboard `Pipeline Health` (uid `rlrp-pipeline-health`) | M6 |
 | **Monitoring stack memory** | **~90 MB total**: Grafana 55.4 MB, Prometheus 24.7 MB, Pushgateway 9.4 MB | 2026-09-04 | `docker stats --no-stream`. Cheap enough to leave running alongside the pipeline | M6 |
 | **API latency, containerized over a 9p bind mount** | `/health` **p50 1.25ms / p95 2.4ms**; `/api/v1/prices/{ticker}` **p50 75.9ms / p95 99.1ms**; `/api/v1/lakehouse/stats` **p50 492ms / p95 948ms** | 2026-09-04 | Prometheus `histogram_quantile` over the live histogram, 218 real requests. **Notably slower than the M4 figures** (24.26ms and 86.83ms p50) measured on Windows-native uvicorn - see the note below on why | M6 |
-| **Retrieval quality, precision@1** | **0.667** (10/15 questions ranked the labelled document first) | 2026-09-05 | `python scripts/eval_retrieval.py` against the 15-question labelled set in `docs/eval/retrieval_eval.yaml`. Index built fresh from the 3 committed context documents only, so the figure is reproducible from a clean checkout | M8 |
-| **Retrieval quality, MRR** | **0.789** across 15 questions | 2026-09-05 | Same run. Mean reciprocal rank of the labelled document | M8 |
-| Retrieval quality, hit rate@3 | 1.000 (15/15) - **not an informative number** | 2026-09-05 | Same run. With a 3-document corpus, "was the right document in the top 3?" is answered trivially yes. Recorded only so nobody quotes it as evidence of quality; precision@1 and MRR are the figures that carry information | M8 |
-| **Retrieval query latency, warm embedding** | **0.172s mean** across 15 queries | 2026-09-05 | Same run, measured per query. Far below the 4.49-5.47s recorded in M3 because that figure includes the embedding model cold load; this is warm-path only. Both are real, of different things | M8 |
-| **Containerised briefing, end to end** | **HTTP 200 in 956.20s** (retrieval 20.76s + generation 926.87s) | 2026-09-05 | `POST /api/v1/briefings/MSFT` against the compose stack with the `llm` profile up. The API container reached the Ollama container by service name over the compose network - the path that previously could not work at all, because Ollama ran on Windows while the containers run in WSL2 and the firewall blocks that hop. Cited 4 sources: 2 prior briefings + `tickers.md` + `schema_notes.md`. Cold model load included | M8 |
-| **Containerised briefing, warm** (model already resident) | **708.62s** (retrieval 1.16s + generation 705.72s) | 2026-09-05 | Second `POST /api/v1/briefings` with `ollama ps` confirming the model resident. Retrieval is *faster* than the native 4.5s figure; generation is ~7.6x the native warm 92.57s. Not cold-start - see the note below on why | M8 |
+| **Retrieval quality, precision@1 - BEFORE chunking** | **0.528** (19/36) | 2026-09-06 | `python scripts/eval_retrieval.py` with `RAG_CHUNKING=false`, against the 36-question labelled set. One vector per document | M8 |
+| **Retrieval quality, precision@1 - AFTER chunking** | **0.917** (33/36), **+0.389** | 2026-09-06 | Same 36 questions, `RAG_CHUNKING=true`, 24 chunks. Misses fell from 17 to 3 | M8 |
+| **Retrieval quality, MRR - before / after** | **0.731 -> 0.958** (+0.227) | 2026-09-06 | Same runs | M8 |
+| **hit@k after chunking** | k=1 0.917, **k=2 1.000**, k>=3 1.000 | 2026-09-06 | Same run. Accuracy saturates at k=2, which is why `RAG_TOP_K` was raised to 6 for context volume rather than for recall | M8 |
+| Retrieval quality on the earlier 15-question set | precision@1 0.667, MRR 0.789 | 2026-09-05 | Superseded. Kept because it shows the small-sample effect: the same code scored 0.667 on 15 questions and 0.528 on 36. The larger set is the one to quote | M8 |
+| **Context delivered to the prompt** | before: 5,729 chars at k=4 (**the entire corpus**); after: 2,037 chars at k=6 | 2026-09-06 | Mean characters of retrieved passages per query. Before chunking, k=4 over a 3-document corpus returned every document every time - retrieval was not selecting anything | M8 |
+| **Containerised briefing, end to end** | **HTTP 200 in 956.20s** (retrieval 20.76s + generation 926.87s) | 2026-09-05 | `POST /api/v1/briefings/MSFT` against the compose stack with the `llm` profile up. The API container reached the Ollama container by service name over the compose network - the path that previously could not work at all, because Ollama ran on Windows while the containers run in WSL2 and the firewall blocks that hop. Cited 4 sources: 2 prior briefings + `tickers.md` + `schema_notes.md`. Cold model load included. **Verified manually on this machine, once - not by CI**, and this is the *compose* path; the Kubernetes path is built but has never been run | M8 |
+| **Containerised briefing, warm** (model already resident) | **708.62s** (retrieval 1.16s + generation 705.72s) | 2026-09-05 | Second `POST /api/v1/briefings` with `ollama ps` confirming the model resident. Retrieval is *faster* than the native 4.5s figure; generation is ~7.6x the native warm 92.57s. Not cold-start - see the note below on why. **Single manual run, not CI-verified** | M8 |
 | **Containerised token throughput** | **1.54-1.72 tok/s generation** (2 samples), 2.94 tok/s prompt eval | 2026-09-05 | Raw `ollama.chat` timing fields from inside the container. Against the native warm figure of 2.73 tok/s generation / 3.26 tok/s prompt eval: generation is ~1.6x slower, prompt eval barely moves | M8 |
 | **Containerised llama3 resident memory** | **6.18 GB** (llama3 6.2 GB + nomic-embed-text 370 MB reported by `ollama ps`) | 2026-09-05 | `docker stats` on `rlrp-ollama` while generating. Higher than the 5.0-5.6 GB estimated when sizing this: with the rest of the stack (~570 MB) the total is ~6.75 GB, which does not fit WSL2's default 5.86 GB allocation. This is why `.wslconfig` now sets `memory=8GB` - the estimate would have been optimistic enough to fail | M8 |
 | Runtime memory, stack with containerised LLM | ~6.75 GB total: ollama 6.18 GB, Kafka 391 MB, API 131 MB, UI 47 MB | 2026-09-05 | `docker stats --no-stream` with the `llm` profile up and a briefing in flight, against WSL2's 7.76 GiB | M8 |
@@ -281,6 +283,45 @@ when the lakehouse arrives over a cross-OS mount, and that the fix for both is
 the same one already recorded: push the predicate into the Parquet scan so the
 reader touches fewer files.
 
+## What verified what
+
+Every row above says *how* it was measured. This says *what checked it*, because
+"measured once by hand" and "re-checked on every push" are different levels of
+confidence and the table does not distinguish them.
+
+| Claim | Verified by | Not verified by |
+|---|---|---|
+| Batch ingest -> curated Delta | Manual `airflow dags test` in WSL2 | CI does not run Airflow |
+| Kafka -> Spark -> Delta streaming | **CI, every push** (`compose-e2e` asserts rows that did not exist before) | - |
+| API endpoints, OpenAPI, `/metrics` | **CI, every push** | - |
+| UI -> API over cluster DNS | **CI, every push** (`k8s-smoke`) | - |
+| Helm install + upgrade | **CI, every push**, with `ollama.enabled=false` | The Ollama path is never exercised |
+| Image contents (what each image may/may not contain) | **CI, every push** | - |
+| Native briefing (65-93s warm) | Manual, this machine | CI |
+| **Containerised briefing (705.72s warm)** | **Manual, this machine, once** | **CI - see below** |
+| **In-cluster (Kubernetes) briefing** | **Nothing. Never run.** | Everything |
+| Retrieval quality (precision@1, MRR) | Manual, this machine, two identical runs | CI (needs an embedding model) |
+| kind cluster stability soak | Manual, one 23-minute run | CI |
+
+**No briefing is verified by CI on any path.** CI runners have no GPU, and a
+CPU generation of ~12 minutes would dominate a 4-minute pipeline. The
+containerised briefing figure comes from a single manual run on this machine.
+
+**The Kubernetes briefing path is built but has never been run.** The chart
+gained an optional Ollama Deployment, Service and PVC, and `helm template`/
+`helm install` are exercised in CI - but with `ollama.enabled=false`. The
+k8s smoke test passing proves the chart still renders and deploys correctly
+with the new template present; it proves nothing about whether a briefing works
+in-cluster. Anywhere that reads as "briefings work on Kubernetes" is
+overstating it, and the deployment matrices in README.md and docs/DEMO.md mark
+that cell "built, unverified" for exactly this reason.
+
+**Sample sizes worth knowing.** Several figures here are single runs: the
+containerised cold briefing (1), the containerised warm briefing (1), the kind
+soak (1), containerised token throughput (2 samples). They are real
+measurements, not estimates, but they carry the uncertainty of small samples
+and are not averages.
+
 ## Containerised briefings: they work, and they are slower
 
 Closing the containerised-briefing gap made the RAG path work under compose and
@@ -333,64 +374,93 @@ now lives in the same always-on Ollama instance with a 30-minute keep-alive
 instead of being evicted by llama3 between calls - the "model thrashing"
 recorded under M3.
 
-## Retrieval quality: what the 0.667 actually says
+## Retrieval quality: measured, then improved
 
-`docs/METRICS.md` recorded how *fast* retrieval was long before it recorded
-whether it returned the *right* thing. This closes that gap, and the number is
-mid-range rather than flattering, which makes it worth reading carefully.
+### Sample size first
 
-**Setup.** 15 labelled questions (`docs/eval/retrieval_eval.yaml`), 5 per
-document, against the 3 committed context documents. Questions are deliberately
-phrased so they do not quote their target document - a query copied out of the
-file it is meant to retrieve would score highly on overlap alone and measure
-nothing. A test enforces that (no 5-word run from a question may appear verbatim
-in its own label).
+The first version of this evaluation used 15 questions and scored precision@1
+0.667. Expanding the same set to **36 questions** (12 per document) scored
+**0.528** on the *same code*. The smaller sample was optimistic by ~0.14.
 
-**Result.** precision@1 = 0.667 (10/15), MRR = 0.789.
+**36 questions is still a small sample.** Every figure below is indicative
+rather than precise: one question flipping moves precision@1 by 0.028, and no
+confidence interval is claimed. They are good enough to compare two
+configurations against each other, which is what they are used for, and not
+good enough to quote as a general accuracy claim about the system.
 
-**hit rate@3 = 1.000 is not a quality signal.** The corpus is 3 documents, so
-"was the right one in the top 3?" is answered trivially yes. It is recorded only
-so that it cannot be quoted as if it meant something. precision@1 and MRR are
-the informative figures, and any quotation of them should carry the corpus size.
+### Before and after
 
-**Where the misses are, and why.** 4 of the 5 misses were `tickers.md`
-questions. That is not random: `src/rag/index_builder.py` embeds **one vector
-per document with no chunking**, and `tickers.md` is a list of 17 different
-companies. A single embedding of that list averages across all of them, so it
-matches no individual-company query strongly - "which holding is the clearest
-proxy for AI infrastructure spending?" lost to `methodology.md`.
+Setup: labelled questions in `docs/eval/retrieval_eval.yaml`, index rebuilt
+from the committed context documents only so the figure is reproducible from a
+clean checkout. Questions are phrased so they do not quote their target
+document, and a test enforces that.
 
-**The diagnosis was tested, not assumed.** Re-running the same 15 questions
-against a corpus where only `tickers.md` was split into one chunk per company
-(19 documents total, other docs untouched):
-
-| | Whole-document (shipped) | tickers.md chunked per company |
+| | Before (one vector per document) | After (24 chunks) |
 |---|---|---|
-| precision@1 | 0.667 | **0.800** |
-| MRR | 0.789 | 0.800 |
-| Ticker questions ranked 1st | 1/5 | **5/5** |
+| precision@1 | 0.528 (19/36) | **0.917 (33/36)** |
+| MRR | 0.731 | **0.958** |
+| Misses | 17 | **3** |
+| hit@2 | 0.806 | **1.000** |
+| Context sent to the prompt | 5,729 chars (k=4) | 2,037 chars (k=6) |
 
-All five ticker questions go from miss to rank-1, which confirms the cause.
+### What was actually wrong
 
-**But chunking is not a free win, which is why it is not shipped here.** With
-19 documents instead of 3, three *non*-ticker questions fell out of the top 3
-entirely, twice losing first place to a small ticker chunk. Splitting one
-document changed the retrieval dynamics for every other document. Doing this
-properly means chunking the whole corpus consistently and re-tuning `RAG_TOP_K`,
-then re-measuring - not splitting the one file that showed up in the misses.
-Recorded as a measured, reproducible starting point for that work.
+`index_builder` embedded **one vector per file**. `tickers.md` is a list of 17
+companies, so it became a single vector averaged across all of them, matching
+no individual-company query strongly. 12 of the original 17 misses were ticker
+questions.
 
-**Reproducibility was checked, not assumed.** Two independent runs of
-`scripts/eval_retrieval.py` returned identical figures - precision@1 0.6667,
-MRR 0.7889 - and the same five failing question ids. The eval builds its index
-from the committed context documents only; scoring against the live index would
-have included whatever generated briefings happened to be present and made the
-number unrepeatable.
+Chunking now splits on markdown structure: `##` sections become chunks, and a
+section that is mostly a list (4+ bullets) becomes one chunk per item, each
+prefixed with its heading. Prose sections stay whole, because splitting an
+argument mid-way loses the context that makes it retrievable. Two refinements
+came out of inspecting the output rather than trusting it: a chunk containing
+only a title line was being emitted (a vector that can match a query without
+answering it), and every ticker chunk initially carried the same 200-character
+lead-in paragraph, which diluted the one part that distinguished them.
 
-**On the latency difference.** The mean query latency here is 0.172s, against
-the 4.49-5.47s recorded under M3. Both are real and they measure different
-things: the M3 figure is a cold path that includes loading the embedding model,
-this one is warm-path only, with the model already resident.
+### The finding that reframed the tuning
+
+Before chunking, **k=4 over a 3-document corpus returned the entire corpus on
+every query** - all 5,729 characters of it. The retrieval step was not
+selecting anything; it was forwarding everything. That is why the "before"
+hit@3 was a perfect 1.000 and meant nothing.
+
+Chunking makes retrieval actually select, which is also why `RAG_TOP_K` needed
+retuning rather than leaving at 4: chunks are ~5x smaller than the documents
+they replaced, so k=4 would hand the model a quarter of the context it used to
+get. **k was raised to 6 for context volume, not for accuracy** - accuracy
+saturates at k=2 - and the eval confirms no precision is lost.
+
+### Remaining misses
+
+Three, all in `methodology.md`: `method-overclaiming`, `method-seed-source`,
+`method-tick-magnitude`. Each asks about a detail (the +/-30bps tick size, the
+seed value, what a write-up should avoid claiming) that sits inside a longer
+prose section, so the section's vector is dominated by its main topic. Fixing
+these would mean splitting prose sections further, which risks the opposite
+failure. Recorded rather than chased.
+
+### A bug the improvement exposed
+
+Switching chunking on changed entry ids from `tickers.md` to
+`tickers.md#0..16`, and `build_index` used `upsert` - which adds and overwrites
+but never deletes. The **stale whole-file vector survived in the live
+collection alongside the 17 chunks meant to replace it**: `collection_count`
+was 39 against `docs_indexed` 34. The single averaged embedding that chunking
+exists to eliminate was still competing in every query.
+
+The evaluation did not catch this, because it builds a fresh index in a temp
+directory each run; only the long-lived index at `data/vectorstore/` was
+affected. `build_index` now removes ids that are no longer present and reports
+`stale_removed`. Deleting a source document orphaned an entry the same way, and
+a regression test covers that case.
+
+### On the latency difference
+
+Mean query latency is 0.099-0.172s here against the 4.49-5.47s recorded under
+M3. Both are real and measure different things: the M3 figure includes loading
+the embedding model, these are warm-path only.
 
 ## Machine baseline (for context on all timings)
 

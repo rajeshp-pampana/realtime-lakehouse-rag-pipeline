@@ -43,8 +43,19 @@ TICK_INTERVAL_SECONDS = float(os.environ.get("TICK_INTERVAL_SECONDS", "1"))
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3")
 OLLAMA_EMBED_MODEL = os.environ.get("OLLAMA_EMBED_MODEL", "nomic-embed-text")
-RAG_TOP_K = int(os.environ.get("RAG_TOP_K", "4"))
+# Retuned from 4 to 6 alongside chunking, measured rather than guessed:
+# retrieval accuracy saturates far below it (hit@2 is already 1.000 on the eval
+# corpus), so a larger k costs no precision, and chunks are ~5x smaller than the
+# whole documents they replaced - at k=4 the model would receive a quarter of
+# the context it used to. 6 restores some of that while leaving headroom as
+# generated briefings accumulate in the live index. See docs/METRICS.md.
+RAG_TOP_K = int(os.environ.get("RAG_TOP_K", "6"))
 RAG_COLLECTION = os.environ.get("RAG_COLLECTION", "market_context")
+# Split documents into chunks before embedding rather than one vector per file.
+# Measured: whole-document embedding of a 17-item list scored precision@1 0.528;
+# see docs/METRICS.md for the before/after. Switchable so that comparison stays
+# reproducible.
+RAG_CHUNKING = os.environ.get("RAG_CHUNKING", "true").lower() in ("1", "true", "yes")
 CONTEXT_DOCS_DIR = os.environ.get("CONTEXT_DOCS_DIR", "docs/context")
 BRIEFINGS_DIR = os.environ.get("BRIEFINGS_DIR", "data/briefings")
 
