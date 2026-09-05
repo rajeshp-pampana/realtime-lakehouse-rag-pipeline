@@ -1,3 +1,5 @@
+https://github.com/user-attachments/assets/f621e59c-5420-49b4-92c7-1dce25489390
+
 # realtime-lakehouse-rag-pipeline
 
 A hybrid **batch + streaming Lakehouse** for multi-asset equity data, with a
