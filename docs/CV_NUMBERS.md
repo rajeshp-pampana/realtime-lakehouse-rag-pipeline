@@ -101,7 +101,7 @@ Then pick from the following, depending on the role's emphasis.
 | 0 pod restarts, 23 min soak | M5 soak test | Needed a WSL2 keep-alive; the cluster is not otherwise stable on this host |
 | 980 MB API image | M5 image size | Still large — dominated by pandas/pyarrow, not by anything removable |
 | 4.3 min CI | M6 CI duration | Wall clock across parallel jobs; 9.8 runner-minutes total |
-| 64 tests | test suite | 4 skip locally (need Spark/Ollama); all run in CI |
+| 91 tests | test suite | 3 skip locally (need Spark/Ollama); all run in CI |
 | ~90 MB monitoring stack | M6 monitoring memory | Idle footprint with a small time series volume |
 
 ---

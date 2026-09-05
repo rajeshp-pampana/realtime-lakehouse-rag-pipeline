@@ -134,7 +134,7 @@ retrieval around it costs ~4.5s and the entire Delta read costs ~24 ms.
 | Cluster stability soak | **23 min continuous**, 21 samples, every one healthy |
 | Monitoring stack overhead | **~90 MB** (Grafana 55, Prometheus 25, Pushgateway 9) |
 | Full CI pipeline | **4.3 min** wall clock, 9.8 runner-minutes, 6 parallel jobs |
-| Test suite | **64 tests** |
+| Test suite | **91 tests** (88 passed, 3 skipped locally) |
 
 ---
 
@@ -156,6 +156,10 @@ docker compose up                                 # kafka + api + ui
 
 - API + Swagger docs → <http://localhost:8000/docs>
 - Streamlit console → <http://localhost:8501>
+
+For running it in front of someone — start/stop commands, the warm-up step that
+keeps a live briefing under 90s instead of 7 minutes, and a troubleshooting
+table — see [docs/DEMO.md](docs/DEMO.md).
 
 Add the optional stacks as needed:
 
@@ -531,6 +535,7 @@ realtime-lakehouse-rag-pipeline/
 ├── docs/
 │   ├── METRICS.md                       # every measured number, with method
 │   ├── CV_NUMBERS.md                    # CV-ready figures, each traced to a metric
+│   ├── DEMO.md                          # start/stop runbook for showing it live
 │   └── context/                         # committed docs that seed the RAG index
 ├── data/                                # Delta tables, vector store, briefings - gitignored
 └── .github/workflows/ci.yml             # lint/test, image builds, compose e2e, kind
@@ -546,7 +551,7 @@ pushes burning minutes.
 
 | Job | What it proves |
 |---|---|
-| `lint-and-test` | ruff + the full 64-test suite |
+| `lint-and-test` | ruff + the full 91-test suite |
 | `build-images` (x3) | Each image builds and contains what it should — **and nothing it shouldn't** |
 | `compose-e2e` | Kafka -> producer -> Spark consumer -> Delta, asserting rows that did not exist before, plus `/metrics` exposition |
 | `k8s-smoke` | Helm lint/render, deploy to a real kind cluster, UI->API over cluster DNS, upgrade path |
